@@ -284,7 +284,7 @@ pub mod sync;
 mod text_diff;
 mod text_value;
 pub mod transaction;
-mod types;
+pub mod types;
 mod value;
 
 pub use crate::automerge::{Automerge, LoadOptions, OnPartialLoad, SaveOptions, StringMigration};
