@@ -1,13 +1,12 @@
-use crate::automerge::diff::RichTextDiff;
 use crate::hydrate::Value;
-use crate::op_set2::types::{Action, KeyRef, MarkData, PropRef2};
+use crate::iter::RichTextDiff;
+use crate::op_set2::types::{Action, KeyRef, MarkData, PropRef};
 use crate::op_set2::SuccInsert;
-use crate::patches::TextRepresentation;
 use crate::types::{
-    ActorId, ElemId, ListEncoding, ObjId, ObjType, OpId, Prop, ScalarValue, SmallHashMap,
+    ActorId, ElemId, ObjId, ObjType, OpId, Prop, ScalarValue, SequenceType, SmallHashMap,
 };
-use crate::AutomergeError;
 use crate::{Automerge, Change, ChangeHash, PatchLog};
+use crate::{AutomergeError, TextEncoding};
 
 use super::super::op::{ChangeOp, Op, OpBuilder};
 use super::super::op_set::{ObjIdIter, ObjIndex, OpIter, OpSet};
@@ -50,7 +49,8 @@ struct Untangler<'a> {
     top: Top,
     conflicts: &'a mut Vec<Adjust>,
     value: ValueState<'a>,
-    encoding: ListEncoding,
+    seq_type: SequenceType,
+    text_encoding: TextEncoding,
     count: usize,
     index: usize,
     max: usize,
@@ -76,11 +76,11 @@ impl<'a> Untangler<'a> {
 
         if doc_op.insert {
             self.flush(log);
-            self.value.key = Some(PropRef2::Seq(self.index));
+            self.value.key = Some(PropRef::Seq(self.index));
         }
 
         if doc_op.visible() && !deleted {
-            self.width = doc_op.width(self.encoding);
+            self.width = doc_op.width(self.seq_type, self.text_encoding);
         }
         self.value.process_doc_op(doc_op, deleted);
         self.top.process_doc_op(self.change_ops, doc_op, deleted);
@@ -93,7 +93,7 @@ impl<'a> Untangler<'a> {
                 self.change_ops[last].pos = Some(doc_op.pos);
                 self.change_ops[last].subsort = self.count;
                 if self.change_ops[last].visible() {
-                    self.width = self.change_ops[last].width(self.encoding);
+                    self.width = self.change_ops[last].width(self.seq_type, self.text_encoding);
                 }
                 self.value.process_change_op(&self.change_ops[last]);
                 self.count += 1;
@@ -111,7 +111,7 @@ impl<'a> Untangler<'a> {
             self.change_ops[*i].subsort = self.count;
             self.width = 0;
             if self.change_ops[*i].visible() {
-                self.width = self.change_ops[*i].width(self.encoding);
+                self.width = self.change_ops[*i].width(self.seq_type, self.text_encoding);
             }
             self.value.process_change_op(&self.change_ops[*i]);
 
@@ -221,14 +221,28 @@ impl<'a> Untangler<'a> {
 
         if let Some(p) = vis {
             let op = &mut self.change_ops[p];
-            if self.encoding == ListEncoding::List {
-                let value = op.hydrate_value_and_fix_counters(self.encoding.into());
+            if self.seq_type == SequenceType::List {
+                let value = op.hydrate_value_and_fix_counters(self.text_encoding);
                 log.insert(op.bld.obj, self.index, value, op.id(), conflict);
                 self.index += 1;
             } else {
                 let marks = self.value.marks.after.current().cloned();
-                log.splice(op.bld.obj, self.index, op.bld.as_str(), marks);
-                self.index += op.width(self.encoding);
+                match op.bld.action {
+                    Action::MakeMap => {
+                        // Block markers
+                        log.insert(
+                            op.bld.obj,
+                            self.index,
+                            Value::map(),
+                            op.bld.id,
+                            op.conflicted,
+                        );
+                    }
+                    _ => {
+                        log.splice(op.bld.obj, self.index, op.bld.as_str(), marks);
+                    }
+                }
+                self.index += op.width(self.seq_type, self.text_encoding);
             }
         }
 
@@ -237,7 +251,8 @@ impl<'a> Untangler<'a> {
 
     fn new(
         obj: ObjId,
-        encoding: ListEncoding,
+        encoding: SequenceType,
+        text_encoding: TextEncoding,
         conflicts: &'a mut Vec<Adjust>,
         change_ops: &'a mut [ChangeOp],
         pred: &'a mut PredCache,
@@ -249,7 +264,7 @@ impl<'a> Untangler<'a> {
         let mut stack: Vec<usize> = Vec::with_capacity(change_ops.len());
         let mut updates: SmallHashMap<ElemId, Vec<usize>> = HashMap::default();
         let mut last_e = None;
-        let value = ValueState::new(obj, encoding);
+        let value = ValueState::new(obj, encoding, text_encoding);
         for (i, op) in change_ops.iter_mut().enumerate() {
             if let Some(v) = pred.remove(&op.id()) {
                 op.succ = v;
@@ -281,7 +296,8 @@ impl<'a> Untangler<'a> {
             pred,
             change_ops,
             updates,
-            encoding,
+            seq_type: encoding,
+            text_encoding,
             conflicts,
             updates_stack,
             top: Top::Nothing,
@@ -378,6 +394,7 @@ impl<'a, 'b> MapWalker<'a, 'b> {
     fn new(
         obj: ObjId,
         mut ops: OpIter<'a>,
+        text_encoding: TextEncoding,
         pred: &'b mut PredCache,
         succ: &'b mut Vec<SuccInsert>,
         log: &'b mut PatchLog,
@@ -385,7 +402,7 @@ impl<'a, 'b> MapWalker<'a, 'b> {
     ) -> Self {
         let pos = ops.pos();
         let doc_op = ops.next();
-        let value = ValueState::new(obj, ListEncoding::List);
+        let value = ValueState::new(obj, SequenceType::List, text_encoding);
         let top = Top::Nothing;
         MapWalker {
             ops,
@@ -412,9 +429,9 @@ impl<'a, 'b> MapWalker<'a, 'b> {
 
         self.advance_doc_op(pos, ops);
 
-        if ops[pos].prop2() != self.value.key {
+        if ops[pos].prop() != self.value.key {
             self.value.map_flush(self.log);
-            self.value.key = ops[pos].prop2_static();
+            self.value.key = ops[pos].prop_static();
             self.top.reset(self.conflicts);
         }
         self.value.process_change_op(&ops[pos]);
@@ -432,9 +449,9 @@ impl<'a, 'b> MapWalker<'a, 'b> {
                 Some(Ordering::Equal) if d.id > ops[pos].id() => break,
                 _ => {
                     let deleted = process_pred(self.doc_op.as_ref(), self.pred, self.succ);
-                    if d.prop2() != self.value.key {
+                    if d.prop() != self.value.key {
                         self.value.map_flush(self.log);
-                        self.value.key = d.prop2();
+                        self.value.key = d.prop();
                         self.top.reset(self.conflicts);
                     }
                     self.value.process_doc_op(d, deleted);
@@ -448,7 +465,7 @@ impl<'a, 'b> MapWalker<'a, 'b> {
     fn finish(&mut self, ops: &mut [ChangeOp]) {
         while let Some(d) = self.doc_op.as_ref() {
             let deleted = process_pred(self.doc_op.as_ref(), self.pred, self.succ);
-            if d.prop2() == self.value.key {
+            if d.prop() == self.value.key {
                 self.top.process_doc_op(ops, d, deleted);
                 self.value.process_doc_op(d, deleted);
                 self.next_doc_op();
@@ -479,8 +496,9 @@ fn process_pred(doc_op: Option<&Op<'_>>, pred: &mut PredCache, succ: &mut Vec<Su
 #[derive(Debug, Clone)]
 struct ValueState<'a> {
     obj: ObjId,
-    encoding: ListEncoding,
-    key: Option<PropRef2<'a>>,
+    seq_type: SequenceType,
+    text_encoding: TextEncoding,
+    key: Option<PropRef<'a>>,
     doc: OpValueOption,
     change: OpValueOption,
     marks: RichTextDiff<'a>,
@@ -558,10 +576,11 @@ impl OpValueOption {
 }
 
 impl<'a> ValueState<'a> {
-    fn new(obj: ObjId, encoding: ListEncoding) -> Self {
+    fn new(obj: ObjId, encoding: SequenceType, text_encoding: TextEncoding) -> Self {
         Self {
             obj,
-            encoding,
+            seq_type: encoding,
+            text_encoding,
             key: None,
             doc: OpValueOption(None),
             change: OpValueOption(None),
@@ -578,11 +597,8 @@ impl<'a> ValueState<'a> {
             }
             _ => {
                 if doc_op.visible() {
-                    self.doc.set(
-                        doc_op.hydrate_value(self.encoding.into()),
-                        doc_op.id,
-                        deleted,
-                    );
+                    self.doc
+                        .set(doc_op.hydrate_value(self.text_encoding), doc_op.id, deleted);
                 }
             }
         }
@@ -619,7 +635,7 @@ impl<'a> ValueState<'a> {
             _ => {
                 if op.visible() {
                     self.change
-                        .set(op.hydrate_value(self.encoding.into()), op.id(), false);
+                        .set(op.hydrate_value(self.text_encoding), op.id(), false);
                 }
             }
         }
@@ -629,7 +645,7 @@ impl<'a> ValueState<'a> {
         let obj = self.obj;
         let change = self.change.take();
         let doc = self.doc.take();
-        if let Some(PropRef2::Map(key)) = self.key.take() {
+        if let Some(PropRef::Map(key)) = self.key.take() {
             Self::map_process(obj, &key, doc, change, log);
         }
     }
@@ -639,8 +655,8 @@ impl<'a> ValueState<'a> {
             return;
         }
         let obj = self.obj;
-        let encoding = self.encoding;
-        if encoding == ListEncoding::List {
+        let encoding = self.seq_type;
+        if encoding == SequenceType::List {
             match (self.doc.0.take(), self.change.0.take()) {
                 (None, Some(c)) => log.insert(obj, index, c.value, c.id, c.conflict),
                 (Some(d), Some(c)) if d.id == c.id => {
@@ -668,16 +684,30 @@ impl<'a> ValueState<'a> {
         } else {
             match (self.doc.0.take(), self.change.0.take()) {
                 (None, Some(c)) => {
-                    let marks = self.marks.after.current().cloned();
-                    log.splice(obj, index, c.value.as_str(), marks);
+                    match c.value {
+                        Value::Scalar(_) => {
+                            // I don't think this branch can ever actually happen in practice. If we
+                            // reach here it's because there is a non-inserting operation (i.e. an
+                            // update) to the operation at `index`, but we only allow insertions
+                            // into text objects. Regardless, we handle this is a splice just in
+                            // case
+                            log.splice(obj, index, c.value.as_str(), self.marks.current().export());
+                        }
+                        _ => log.insert(obj, index, c.value, c.id, c.conflict),
+                    }
                 }
                 (Some(d), None) if d.deleted => {
-                    let w = d.value.width(encoding);
+                    let w = d.value.width(self.seq_type, self.text_encoding);
                     log.delete_seq(obj, index, w);
                 }
                 (Some(d), None) => {
-                    if let Some(m) = self.marks.current() {
-                        log.mark(obj, index, d.value.width(encoding), &m);
+                    if let Some(m) = self.marks.current().export() {
+                        log.mark(
+                            obj,
+                            index,
+                            d.value.width(self.seq_type, self.text_encoding),
+                            &m,
+                        );
                     }
                 }
                 _ => {}
@@ -723,16 +753,7 @@ impl<'a> ValueState<'a> {
     }
 }
 
-fn walk_map(
-    obj: ObjId,
-    doc_ops: OpIter<'_>,
-    change_ops: &mut [ChangeOp],
-    pred: &mut PredCache,
-    succ: &mut Vec<SuccInsert>,
-    conflicts: &mut Vec<Adjust>,
-    log: &mut PatchLog,
-) {
-    let mut mw = MapWalker::new(obj, doc_ops, pred, succ, log, conflicts);
+fn walk_map(mw: &mut MapWalker<'_, '_>, change_ops: &mut [ChangeOp]) {
     for pos in 0..change_ops.len() {
         mw.change_op(change_ops, pos);
     }
@@ -811,19 +832,29 @@ impl BatchApply {
             let obj_range = walker.seek_to_obj(os.obj);
             let doc_ops = doc.ops().iter_range(&obj_range);
             match obj_info.object_type(&os.obj) {
-                Some(ObjType::Map) => walk_map(
-                    os.obj,
-                    doc_ops,
-                    &mut self.ops[os.span.clone()],
-                    &mut self.pred,
-                    &mut succ,
-                    &mut conflicts,
-                    log,
-                ),
+                Some(ObjType::Map) => {
+                    let mut walker = MapWalker::new(
+                        os.obj,
+                        doc_ops,
+                        doc.text_encoding(),
+                        &mut self.pred,
+                        &mut succ,
+                        log,
+                        &mut conflicts,
+                    );
+                    let change_ops = &mut self.ops[os.span.clone()];
+                    walk_map(&mut walker, change_ops);
+                }
                 Some(otype) if otype.is_sequence() => {
+                    let sequence_type = match otype {
+                        ObjType::Text => SequenceType::Text,
+                        ObjType::List => SequenceType::List,
+                        _ => unreachable!(),
+                    };
                     let ut = Untangler::new(
                         os.obj,
-                        doc.text_rep(otype),
+                        sequence_type,
+                        doc.text_encoding(),
                         &mut conflicts,
                         &mut self.ops[os.span.clone()],
                         &mut self.pred,
@@ -955,10 +986,7 @@ impl Automerge {
         &mut self,
         changes: impl IntoIterator<Item = Change> + Clone,
     ) -> Result<(), AutomergeError> {
-        self.apply_changes_batch_log_patches(
-            changes,
-            &mut PatchLog::inactive(TextRepresentation::String(self.text_encoding())),
-        )
+        self.apply_changes_batch_log_patches(changes, &mut PatchLog::inactive())
     }
 
     pub fn apply_changes_batch_log_patches<I: IntoIterator<Item = Change>>(
@@ -1232,16 +1260,16 @@ mod tests {
     #[test]
     fn multi_put_batch_apply() {
         let mut rng = make_rng();
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let list = doc1.put_object(&ROOT, "list", ObjType::List).unwrap();
         doc1.insert(&list, 0, "a").unwrap();
         doc1.insert(&list, 1, "b").unwrap();
         doc1.insert(&list, 2, "c").unwrap();
         let heads = doc1.get_heads();
 
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
         for i in 0..10 {
-            let mut tmp = doc1.fork().with_actor(rng.gen());
+            let mut tmp = doc1.fork().with_actor(rng.random());
             tmp.put(&list, 0, i).unwrap();
             doc2.merge(&mut tmp).unwrap();
         }
@@ -1254,17 +1282,17 @@ mod tests {
     #[test]
     fn multi_insert_batch_apply() {
         let mut rng = make_rng();
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let list = doc1.put_object(&ROOT, "list", ObjType::List).unwrap();
         doc1.insert(&list, 0, "a").unwrap();
         doc1.insert(&list, 1, "b").unwrap();
         doc1.insert(&list, 2, "c").unwrap();
         let heads = doc1.get_heads();
 
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
 
         for i in 0..10 {
-            let mut tmp = doc1.fork().with_actor(rng.gen());
+            let mut tmp = doc1.fork().with_actor(rng.random());
             tmp.insert(&list, 1, i).unwrap();
             //let change = tmp.get_last_local_change().unwrap();
             doc2.merge(&mut tmp).unwrap();
@@ -1279,17 +1307,17 @@ mod tests {
     #[test]
     fn multi_update_batch_apply() {
         let mut rng = make_rng();
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let list = doc1.put_object(&ROOT, "list", ObjType::List).unwrap();
         doc1.insert(&list, 0, "a").unwrap();
         doc1.insert(&list, 1, "b").unwrap();
         doc1.insert(&list, 2, "c").unwrap();
         let heads = doc1.get_heads();
 
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
 
         for i in 0..3 {
-            let mut tmp = doc1.fork().with_actor(rng.gen());
+            let mut tmp = doc1.fork().with_actor(rng.random());
             tmp.put(&list, 2, i).unwrap();
             doc2.merge(&mut tmp).unwrap();
         }
@@ -1312,7 +1340,7 @@ mod tests {
     #[test]
     fn fuzz_batch_list_apply() {
         let mut rng = make_rng();
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let list = doc1.put_object(&ROOT, "list", ObjType::List).unwrap();
         doc1.insert(&list, 0, "a").unwrap();
         doc1.insert(&list, 1, "b").unwrap();
@@ -1324,29 +1352,29 @@ mod tests {
         };
         let heads = doc1.get_heads();
 
-        let mut doc1_tmp = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
+        let mut doc1_tmp = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
 
         for _ in 0..3 {
             for _ in 0..30 {
-                let mut tmp = doc1_tmp.fork().with_actor(rng.gen());
-                let num_inserts = rng.gen::<usize>() % 10 + 1;
-                let num_updates = rng.gen::<usize>() % 10 + 1;
-                let num_deletes = rng.gen::<usize>() % 2;
+                let mut tmp = doc1_tmp.fork().with_actor(rng.random());
+                let num_inserts = rng.random::<u32>() % 10 + 1;
+                let num_updates = rng.random::<u32>() % 10 + 1;
+                let num_deletes = rng.random::<u32>() % 2;
                 for _ in 0..num_inserts {
-                    let len = tmp.length(&list);
-                    let pos = rng.gen::<usize>() % len;
-                    tmp.insert(&list, pos, val()).unwrap();
+                    let len = tmp.length(&list) as u32;
+                    let pos = rng.random::<u32>() % len;
+                    tmp.insert(&list, pos as usize, val()).unwrap();
                 }
                 for _ in 0..num_updates {
-                    let len = tmp.length(&list);
-                    let pos = rng.gen::<usize>() % len;
-                    tmp.put(&list, pos, val()).unwrap();
+                    let len = tmp.length(&list) as u32;
+                    let pos = rng.random::<u32>() % len;
+                    tmp.put(&list, pos as usize, val()).unwrap();
                 }
                 for _ in 0..num_deletes {
-                    let len = tmp.length(&list);
-                    let pos = rng.gen::<usize>() % len;
-                    tmp.delete(&list, pos).unwrap();
+                    let len = tmp.length(&list) as u32;
+                    let pos = rng.random::<u32>() % len;
+                    tmp.delete(&list, pos as usize).unwrap();
                 }
                 doc2.merge(&mut tmp).unwrap();
             }
@@ -1362,7 +1390,7 @@ mod tests {
     #[test]
     fn fuzz_batch_map1_apply() {
         let mut rng = make_rng();
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let map1 = doc1.put_object(&ROOT, "map1", ObjType::Map).unwrap();
         let map2 = doc1.put_object(&map1, "map2", ObjType::Map).unwrap();
         let map3 = doc1.put_object(&map2, "map3", ObjType::Map).unwrap();
@@ -1374,23 +1402,23 @@ mod tests {
         };
         let heads = doc1.get_heads();
 
-        let mut doc1_tmp = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
+        let mut doc1_tmp = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
 
         for _ in 0..3 {
             for _ in 0..30 {
-                let mut tmp = doc1_tmp.fork().with_actor(rng.gen());
-                let num_updates = rng.gen::<usize>() % 10 + 1;
-                let num_deletes = rng.gen::<usize>() % 2;
+                let mut tmp = doc1_tmp.fork().with_actor(rng.random());
+                let num_updates = rng.random::<u32>() % 10 + 1;
+                let num_deletes = rng.random::<u32>() % 2;
                 for _ in 0..num_updates {
-                    let key = format!("key{}", rng.gen::<usize>() % 20);
-                    let map = rng.gen::<usize>() % maps.len();
-                    tmp.put(&maps[map], key, val()).unwrap();
+                    let key = format!("key{}", rng.random::<u32>() % 20);
+                    let map = rng.random::<u32>() % (maps.len() as u32);
+                    tmp.put(&maps[map as usize], key, val()).unwrap();
                 }
                 for _ in 0..num_deletes {
-                    let key = format!("key{}", rng.gen::<usize>() % 20);
-                    let map = rng.gen::<usize>() % maps.len();
-                    tmp.delete(&maps[map], key).unwrap();
+                    let key = format!("key{}", rng.random::<u32>() % 20);
+                    let map = rng.random::<u32>() % (maps.len() as u32);
+                    tmp.delete(&maps[map as usize], key).unwrap();
                 }
                 doc2.merge(&mut tmp).unwrap();
             }
@@ -1406,7 +1434,7 @@ mod tests {
     #[test]
     fn fuzz_batch_map2_apply() {
         let mut rng = make_rng();
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let map1 = doc1.put_object(&ROOT, "map1", ObjType::Map).unwrap();
         let map2 = doc1.put_object(&map1, "map2", ObjType::Map).unwrap();
         let map3 = doc1.put_object(&map2, "map3", ObjType::Map).unwrap();
@@ -1418,23 +1446,23 @@ mod tests {
         };
         let heads = doc1.get_heads();
 
-        let mut doc1_tmp = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
+        let mut doc1_tmp = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
 
         for _ in 0..3 {
             for _ in 0..30 {
-                let mut tmp = doc1_tmp.fork().with_actor(rng.gen());
-                let num_updates = rng.gen::<usize>() % 10 + 1;
-                let num_deletes = rng.gen::<usize>() % 2;
+                let mut tmp = doc1_tmp.fork().with_actor(rng.random());
+                let num_updates = rng.random::<u32>() % 10 + 1;
+                let num_deletes = rng.random::<u32>() % 2;
                 for _ in 0..num_updates {
-                    let key = format!("key{}", rng.gen::<usize>() % 1000);
-                    let map = rng.gen::<usize>() % maps.len();
-                    tmp.put(&maps[map], key, val()).unwrap();
+                    let key = format!("key{}", rng.random::<u32>() % 1000);
+                    let map = rng.random::<u32>() % (maps.len() as u32);
+                    tmp.put(&maps[map as usize], key, val()).unwrap();
                 }
                 for _ in 0..num_deletes {
-                    let key = format!("key{}", rng.gen::<usize>() % 1000);
-                    let map = rng.gen::<usize>() % maps.len();
-                    tmp.delete(&maps[map], key).unwrap();
+                    let key = format!("key{}", rng.random::<u32>() % 1000);
+                    let map = rng.random::<u32>() % (maps.len() as u32);
+                    tmp.delete(&maps[map as usize], key).unwrap();
                 }
                 doc2.merge(&mut tmp).unwrap();
             }
@@ -1476,7 +1504,7 @@ mod tests {
     #[test]
     fn fuzz_batch_map_counter_apply() {
         let mut rng = make_rng();
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let map1 = doc1.put_object(&ROOT, "map1", ObjType::Map).unwrap();
         doc1.put(&map1, "key1", ScalarValue::counter(10)).unwrap();
         doc1.increment(&map1, "key1", 15).unwrap();
@@ -1499,32 +1527,32 @@ mod tests {
         };
         let heads = doc1.get_heads();
 
-        let mut doc1_tmp = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
+        let mut doc1_tmp = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
 
         for _ in 0..4 {
             for _ in 0..30 {
-                let mut tmp = doc1_tmp.fork().with_actor(rng.gen());
-                let num_updates = rng.gen::<usize>() % 10 + 1;
-                let num_deletes = rng.gen::<usize>() % 2;
+                let mut tmp = doc1_tmp.fork().with_actor(rng.random());
+                let num_updates = rng.random::<u32>() % 10 + 1;
+                let num_deletes = rng.random::<u32>() % 2;
                 for _ in 0..num_updates {
-                    let key = format!("key{}", rng.gen::<usize>() % 30);
-                    let map = rng.gen::<usize>() % maps.len();
+                    let key = format!("key{}", rng.random::<u32>() % 30);
+                    let map = rng.random::<u32>() % (maps.len() as u32);
                     if let Ok(Some((
                         types::Value::Scalar(Cow::Owned(ScalarValue::Counter(_))),
                         _,
-                    ))) = tmp.get(&maps[map], &key)
+                    ))) = tmp.get(&maps[map as usize], &key)
                     {
-                        tmp.increment(&maps[map], key, val()).unwrap();
+                        tmp.increment(&maps[map as usize], key, val()).unwrap();
                     } else {
-                        tmp.put(&maps[map], key, ScalarValue::counter(val()))
+                        tmp.put(&maps[map as usize], key, ScalarValue::counter(val()))
                             .unwrap();
                     }
                 }
                 for _ in 0..num_deletes {
-                    let key = format!("key{}", rng.gen::<usize>() % 30);
-                    let map = rng.gen::<usize>() % maps.len();
-                    tmp.delete(&maps[map], key).unwrap();
+                    let key = format!("key{}", rng.random::<u32>() % 30);
+                    let map = rng.random::<u32>() % (maps.len() as u32);
+                    tmp.delete(&maps[map as usize], key).unwrap();
                 }
                 doc2.merge(&mut tmp).unwrap();
             }
@@ -1572,22 +1600,22 @@ mod tests {
             value += 1;
             value
         };
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let list1 = doc1.put_object(&ROOT, "list1", ObjType::List).unwrap();
         doc1.insert(&list1, 0, ScalarValue::counter(val())).unwrap();
         doc1.insert(&list1, 1, ScalarValue::counter(val())).unwrap();
         doc1.insert(&list1, 2, ScalarValue::counter(val())).unwrap();
 
-        let mut doc1_copy = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
-        let mut doc2_copy = doc1.fork().with_actor(rng.gen());
+        let mut doc1_copy = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
+        let mut doc2_copy = doc1.fork().with_actor(rng.random());
 
         let mut changes = vec![];
         //for _ in 0..3 {
         for _ in 0..2 {
             //for _ in 0..10 {
             for _ in 0..2 {
-                let mut tmp = doc2.fork().with_actor(rng.gen());
+                let mut tmp = doc2.fork().with_actor(rng.random());
                 //let num_updates = rng.gen::<usize>() % 10 + 1;
                 let num_updates = 2;
                 //let num_inserts = rng.gen::<usize>() % 10 + 1;
@@ -1596,19 +1624,19 @@ mod tests {
                 let num_deletes = 1;
                 for _ in 0..num_updates {
                     let len = tmp.length(&list1);
-                    let index = rng.gen::<usize>() % len;
-                    tmp.increment(&list1, index, val()).unwrap();
+                    let index = rng.random::<u32>() % (len as u32);
+                    tmp.increment(&list1, index as usize, val()).unwrap();
                 }
                 for _ in 0..num_inserts {
                     let len = tmp.length(&list1);
-                    let index = rng.gen::<usize>() % len;
-                    tmp.insert(&list1, index, ScalarValue::counter(val()))
+                    let index = rng.random::<u32>() % (len as u32);
+                    tmp.insert(&list1, index as usize, ScalarValue::counter(val()))
                         .unwrap();
                 }
                 for _ in 0..num_deletes {
                     let len = tmp.length(&list1);
-                    let index = rng.gen::<usize>() % len;
-                    tmp.delete(&list1, index).unwrap();
+                    let index = rng.random::<u32>() % (len as u32);
+                    tmp.delete(&list1, index as usize).unwrap();
                 }
                 let change = tmp.get_last_local_change().unwrap();
                 changes.push(change);
@@ -1626,37 +1654,37 @@ mod tests {
             value += 1;
             value
         };
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let list1 = doc1.put_object(&ROOT, "list1", ObjType::List).unwrap();
         doc1.insert(&list1, 0, val()).unwrap();
         doc1.insert(&list1, 1, val()).unwrap();
         doc1.insert(&list1, 2, val()).unwrap();
 
-        let mut doc1_copy = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
-        let mut doc2_copy = doc1.fork().with_actor(rng.gen());
+        let mut doc1_copy = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
+        let mut doc2_copy = doc1.fork().with_actor(rng.random());
 
         let mut changes = vec![];
         for _ in 0..3 {
             for _ in 0..30 {
-                let mut tmp = doc2.fork().with_actor(rng.gen());
-                let num_updates = rng.gen::<usize>() % 10 + 1;
-                let num_inserts = rng.gen::<usize>() % 10 + 1;
-                let num_deletes = rng.gen::<usize>() % 2;
+                let mut tmp = doc2.fork().with_actor(rng.random());
+                let num_updates = rng.random::<u32>() % 10 + 1;
+                let num_inserts = rng.random::<u32>() % 10 + 1;
+                let num_deletes = rng.random::<u32>() % 2;
                 for _ in 0..num_updates {
                     let len = tmp.length(&list1);
-                    let index = rng.gen::<usize>() % len;
-                    tmp.put(&list1, index, val()).unwrap();
+                    let index = rng.random::<u32>() % (len as u32);
+                    tmp.put(&list1, index as usize, val()).unwrap();
                 }
                 for _ in 0..num_inserts {
                     let len = tmp.length(&list1);
-                    let index = rng.gen::<usize>() % len;
-                    tmp.insert(&list1, index, val()).unwrap();
+                    let index = rng.random::<u32>() % (len as u32);
+                    tmp.insert(&list1, index as usize, val()).unwrap();
                 }
                 for _ in 0..num_deletes {
                     let len = tmp.length(&list1);
-                    let index = rng.gen::<usize>() % len;
-                    tmp.delete(&list1, index).unwrap();
+                    let index = rng.random::<u32>() % (len as u32);
+                    tmp.delete(&list1, index as usize).unwrap();
                 }
                 let change = tmp.get_last_local_change().unwrap();
                 changes.push(change);
@@ -1674,25 +1702,30 @@ mod tests {
             value += 1;
             value
         };
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let text1 = doc1.put_object(&ROOT, "text1", ObjType::Text).unwrap();
         doc1.splice_text(&text1, 0, 0, "--------").unwrap();
 
-        let mut doc1_copy = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
-        let mut doc2_copy = doc1.fork().with_actor(rng.gen());
+        let mut doc1_copy = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
+        let mut doc2_copy = doc1.fork().with_actor(rng.random());
 
         let mut changes = vec![];
         for _ in 0..10 {
             for _ in 0..5 {
-                let mut tmp = doc2.fork().with_actor(rng.gen());
-                let num_splices = rng.gen::<usize>() % 10 + 1;
+                let mut tmp = doc2.fork().with_actor(rng.random());
+                let num_splices = rng.random::<u32>() % 10 + 1;
                 for _ in 0..num_splices {
-                    let len = tmp.length(&text1);
-                    let index = rng.gen::<usize>() % len;
-                    let del = std::cmp::min(rng.gen::<usize>() % 2, len - index);
-                    tmp.splice_text(&text1, index, del as isize, &format!("[{}]", val()))
-                        .unwrap();
+                    let len = tmp.length(&text1) as u32;
+                    let index = rng.random::<u32>() % len;
+                    let del = std::cmp::min(rng.random::<u32>() % 2, len - index);
+                    tmp.splice_text(
+                        &text1,
+                        index as usize,
+                        del as isize,
+                        &format!("[{}]", val()),
+                    )
+                    .unwrap();
                 }
                 let change = tmp.get_last_local_change().unwrap();
                 changes.push(change);
@@ -1710,32 +1743,37 @@ mod tests {
             value += 1;
             value
         };
-        let mut doc1 = AutoCommit::new().with_actor(rng.gen());
+        let mut doc1 = AutoCommit::new().with_actor(rng.random());
         let text1 = doc1.put_object(&ROOT, "text1", ObjType::Text).unwrap();
         doc1.splice_text(&text1, 0, 0, "---------------------")
             .unwrap();
 
-        let mut doc1_copy = doc1.fork().with_actor(rng.gen());
-        let mut doc2 = doc1.fork().with_actor(rng.gen());
-        let mut doc2_copy = doc1.fork().with_actor(rng.gen());
+        let mut doc1_copy = doc1.fork().with_actor(rng.random());
+        let mut doc2 = doc1.fork().with_actor(rng.random());
+        let mut doc2_copy = doc1.fork().with_actor(rng.random());
 
         let mut changes = vec![];
         for _ in 0..5 {
             for _ in 0..10 {
-                let mut tmp = doc2.fork().with_actor(rng.gen());
-                let num_splices = rng.gen::<usize>() % 10 + 1;
+                let mut tmp = doc2.fork().with_actor(rng.random());
+                let num_splices = rng.random::<u32>() % 10 + 1;
                 for _ in 0..num_splices {
-                    let len = tmp.length(&text1);
-                    let index = rng.gen::<usize>() % len;
-                    let del = std::cmp::min(rng.gen::<usize>() % 2, len - index);
-                    tmp.splice_text(&text1, index, del as isize, &format!("[{}]", val()))
-                        .unwrap();
+                    let len = tmp.length(&text1) as u32;
+                    let index = rng.random::<u32>() % len;
+                    let del = std::cmp::min(rng.random::<u32>() % 2, len - index);
+                    tmp.splice_text(
+                        &text1,
+                        index as usize,
+                        del as isize,
+                        &format!("[{}]", val()),
+                    )
+                    .unwrap();
                 }
-                let num_marks = rng.gen::<usize>() % 3 + 1;
+                let num_marks = rng.random::<u32>() % 3 + 1;
                 for _ in 0..num_marks {
-                    let len = tmp.length(&text1);
-                    let a = rng.gen::<usize>() % len;
-                    let b = rng.gen::<usize>() % len;
+                    let len = tmp.length(&text1) as u32;
+                    let a = rng.random::<u32>() % len;
+                    let b = rng.random::<u32>() % len;
                     if a == b {
                         continue;
                     }
@@ -1744,8 +1782,8 @@ mod tests {
                     let name = "bold".into();
                     let value = ScalarValue::from(val());
                     let mark = Mark {
-                        start,
-                        end,
+                        start: start as usize,
+                        end: end as usize,
                         name,
                         value,
                     };
@@ -1791,29 +1829,29 @@ mod tests {
     #[test]
     fn map_key_conflict() {
         let mut rng = make_rng();
-        let mut doc = AutoCommit::new().with_actor(rng.gen());
+        let mut doc = AutoCommit::new().with_actor(rng.random());
 
         doc.put(&ROOT, "key1", "value1").unwrap();
 
-        const CYCLES: usize = 10;
-        const DOCS: usize = 5;
-        const KEYS: usize = 4;
+        const CYCLES: u32 = 10;
+        const DOCS: u32 = 5;
+        const KEYS: u32 = 4;
 
         let mut docs = vec![];
 
         for _ in 0..DOCS {
-            docs.push(doc.fork().with_actor(rng.gen()));
+            docs.push(doc.fork().with_actor(rng.random()));
         }
 
         for _ in 0..CYCLES {
             for d in &mut docs {
                 for _ in 0..10 {
-                    let k = rng.gen::<usize>() % KEYS;
-                    let val = rng.gen::<usize>();
+                    let k = rng.random::<u32>() % KEYS;
+                    let val = rng.random::<u32>();
                     d.put(&ROOT, format!("key{}", k), format!("value{}", val))
                         .unwrap();
                 }
-                let k = rng.gen::<usize>() % KEYS;
+                let k = rng.random::<u32>() % KEYS;
                 let _ = d.delete(&ROOT, format!("key{}", k));
             }
 
@@ -1831,30 +1869,30 @@ mod tests {
     #[test]
     fn list_element_conflict() {
         let mut rng = make_rng();
-        let mut doc = AutoCommit::new().with_actor(rng.gen());
+        let mut doc = AutoCommit::new().with_actor(rng.random());
 
         let list = doc.put_object(&ROOT, "list", ObjType::List).unwrap();
 
-        const CYCLES: usize = 5;
-        const DOCS: usize = 6;
-        const KEYS: usize = 3;
+        const CYCLES: u32 = 5;
+        const DOCS: u32 = 6;
+        const KEYS: u32 = 3;
 
         for i in 0..KEYS {
-            doc.insert(&list, i, "_").unwrap();
+            doc.insert(&list, i as usize, "_").unwrap();
         }
 
         let mut docs = vec![];
 
         for _ in 0..DOCS {
-            docs.push(doc.fork().with_actor(rng.gen()));
+            docs.push(doc.fork().with_actor(rng.random()));
         }
 
         for _ in 0..CYCLES {
             for d in &mut docs {
                 for _ in 0..3 {
-                    let k = rng.gen::<usize>() % KEYS;
-                    let val = rng.gen::<usize>();
-                    d.put(&list, k, format!("value{}", val)).unwrap();
+                    let k = rng.random::<u32>() % KEYS;
+                    let val = rng.random::<u32>();
+                    d.put(&list, k as usize, format!("value{}", val)).unwrap();
                 }
             }
 
@@ -1871,30 +1909,30 @@ mod tests {
     #[test]
     fn conflicts_with_isolate() {
         let mut rng = make_rng();
-        let mut doc = AutoCommit::new().with_actor(rng.gen());
+        let mut doc = AutoCommit::new().with_actor(rng.random());
 
         let list = doc.put_object(&ROOT, "list", ObjType::List).unwrap();
         let map = doc.put_object(&ROOT, "map", ObjType::Map).unwrap();
         doc.insert(&list, 0, "_").unwrap();
         doc.put(&map, "key", "_").unwrap();
 
-        const CYCLES: usize = 5;
-        const DOCS: usize = 6;
+        const CYCLES: u32 = 5;
+        const DOCS: u32 = 6;
 
         let mut docs = vec![];
         let mut heads = vec![doc.get_heads()];
 
         for _ in 0..DOCS {
-            docs.push(doc.fork().with_actor(rng.gen()));
+            docs.push(doc.fork().with_actor(rng.random()));
         }
 
         for _ in 0..CYCLES {
             for d in &mut docs {
-                let head = rng.gen::<usize>() % heads.len();
-                d.isolate(&heads[head]);
+                let head = rng.random::<u32>() % (heads.len() as u32);
+                d.isolate(&heads[head as usize]);
                 for _ in 0..3 {
-                    let del = rng.gen::<usize>() % 5;
-                    let val = rng.gen::<usize>();
+                    let del = rng.random::<u32>() % 5;
+                    let val = rng.random::<u32>();
                     let len = d.length(&list);
                     let val = format!("value{}", val);
                     if del == 0 {

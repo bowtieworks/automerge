@@ -33,6 +33,7 @@ pub(crate) struct OpIter<'a> {
     pub(super) value: ValueIter<'a>,
     pub(super) marks: MarkInfoIter<'a>,
     pub(super) op_set: &'a OpSet,
+    pub(super) range: Range<usize>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -172,7 +173,7 @@ impl OpId {
 }
 
 impl ObjId {
-    fn try_load(
+    pub(crate) fn try_load(
         actor: Option<Cow<'_, ActorIdx>>,
         ctr: Option<Cow<'_, u64>>,
     ) -> Result<ObjId, ReadOpError> {
@@ -189,6 +190,13 @@ impl ObjId {
                 "missing actor or counter".to_string(),
             )),
         }
+    }
+
+    pub(crate) fn try_load_i(
+        actor: Option<Cow<'_, ActorIdx>>,
+        ctr: Option<Cow<'_, i64>>,
+    ) -> Result<ObjId, ReadOpError> {
+        Self::try_load(actor, ctr.map(|c| Cow::Owned(*c as u64)))
     }
 }
 
@@ -210,7 +218,7 @@ impl ElemId {
 }
 
 impl<'a> KeyRef<'a> {
-    fn try_load(
+    pub(crate) fn try_load(
         key_str: Option<Cow<'a, str>>,
         key_actor: Option<Cow<'a, ActorIdx>>,
         key_counter: Option<Cow<'a, i64>>,
@@ -761,21 +769,22 @@ impl<'a> SuccIterIter<'a> {
         let num_succ = *self.count.shift_next(range.clone()).flatten()? as usize;
         let sub_pos = self.count.calculate_acc().as_usize();
 
-        self.actor.set_max(range.end);
         self.actor.advance_to(sub_pos - num_succ);
-
-        self.ctr.set_max(range.end);
         self.ctr.advance_to(sub_pos - num_succ);
-
-        self.incs.set_max(range.end);
         self.incs.advance_to(sub_pos - num_succ);
 
-        Some(SuccCursors {
+        let iter = SuccCursors {
             len: num_succ,
             succ_actor: self.actor.clone(),
             succ_counter: self.ctr.clone(),
             inc_values: self.incs.clone(),
-        })
+        };
+
+        self.actor.advance_by(num_succ);
+        self.ctr.advance_by(num_succ);
+        self.incs.advance_by(num_succ);
+
+        Some(iter)
     }
 
     pub(crate) fn new(

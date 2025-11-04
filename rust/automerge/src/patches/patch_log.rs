@@ -9,7 +9,7 @@ use crate::{ChangeHash, Patch};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use super::{PatchBuilder, TextRepresentation};
+use super::PatchBuilder;
 
 /// A record of changes made to a document
 ///
@@ -28,11 +28,11 @@ use super::{PatchBuilder, TextRepresentation};
 ///
 /// ```no_run
 /// # use automerge::{AutoCommit, Change, Patch, PatchLog, Value, sync::{Message, State as
-/// SyncState, SyncDoc}, patches::TextRepresentation, TextEncoding};
+/// SyncState, SyncDoc}, TextEncoding};
 /// let doc = AutoCommit::new();
 /// let sync_message: Message = unimplemented!();
 /// let mut sync_state = SyncState::new();
-/// let mut patch_log = PatchLog::active(TextRepresentation::String(TextEncoding::UnicodeCodePoint));
+/// let mut patch_log = PatchLog::active();
 /// doc.sync().receive_sync_message_log_patches(&mut sync_state, sync_message, &mut patch_log);
 ///
 /// // These patches represent the changes needed to go from the state of the document before the
@@ -44,7 +44,6 @@ pub struct PatchLog {
     pub(crate) events: Vec<(ObjId, Event)>,
     expose: HashSet<OpId>,
     active: bool,
-    text_rep: TextRepresentation,
     path_map: BTreeMap<ObjId, (Prop, ObjId)>,
     path_hint: usize,
     pub(crate) heads: Option<Vec<ChangeHash>>,
@@ -161,13 +160,12 @@ impl PatchLog {
     /// # Arguments
     ///
     /// * `active`   - If `true` the log will record all changes made to the document. If [`false`] then no changes will be recorded.
-    /// * `text_rep` - How text will be represented in the generated patches
     ///
     /// Why, you ask, would you create a [`PatchLog`] which doesn't record any changes? Operations
     /// which record patches are more expensive, so sometimes you may wish to turn off patch
     /// logging for parts of the application, but not others; but you don't want to complicate your
     /// code with an [`Option<PatchLog>`]. In that case you can use an inactive [`PatchLog`].
-    pub fn new(active: bool, text_rep: TextRepresentation) -> Self {
+    pub fn new(active: bool) -> Self {
         PatchLog {
             active,
             expose: HashSet::default(),
@@ -175,7 +173,6 @@ impl PatchLog {
             heads: None,
             path_map: Default::default(),
             path_hint: 0,
-            text_rep,
             actors: vec![],
         }
     }
@@ -183,23 +180,19 @@ impl PatchLog {
     /// Create a new [`PatchLog`] which doesn't record any changes.
     ///
     /// See also: [`PatchLog::new()`] for a more detailed explanation.
-    pub fn inactive(text_rep: TextRepresentation) -> Self {
-        Self::new(false, text_rep)
+    pub fn inactive() -> Self {
+        Self::new(false)
     }
 
     pub fn null() -> Self {
-        // Text encoding doesn't matter here as it will never be used
-        Self::new(
-            false,
-            TextRepresentation::String(TextEncoding::UnicodeCodePoint),
-        )
+        Self::new(false)
     }
 
     /// Create a new [`PatchLog`] which does record changes.
     ///
     /// See also: [`PatchLog::new()`] for a more detailed explanation.
-    pub fn active(text_rep: TextRepresentation) -> Self {
-        Self::new(true, text_rep)
+    pub fn active() -> Self {
+        Self::new(true)
     }
 
     pub(crate) fn set_active(&mut self, setting: bool) {
@@ -219,9 +212,9 @@ impl PatchLog {
             .push((obj, Event::DeleteMap { key: key.into() }))
     }
 
-    pub(crate) fn increment2(&mut self, obj: ObjId, prop: PropRef<'_>, value: i64, id: OpId) {
+    pub(crate) fn increment(&mut self, obj: ObjId, prop: PropRef<'_>, value: i64, id: OpId) {
         match prop {
-            PropRef::Map(key) => self.increment_map(obj, key, value, id),
+            PropRef::Map(key) => self.increment_map(obj, &key, value, id),
             PropRef::Seq(index) => self.increment_seq(obj, index, value, id),
         }
     }
@@ -258,7 +251,7 @@ impl PatchLog {
         self.events.push((obj, Event::FlagConflictSeq { index }))
     }
 
-    pub(crate) fn put2(
+    pub(crate) fn put(
         &mut self,
         obj: ObjId,
         prop: PropRef<'_>,
@@ -268,7 +261,7 @@ impl PatchLog {
         expose: bool,
     ) {
         match prop {
-            PropRef::Map(key) => self.put_map(obj, key, value, id, conflict, expose),
+            PropRef::Map(key) => self.put_map(obj, &key, value, id, conflict, expose),
             PropRef::Seq(index) => self.put_seq(obj, index, value, id, conflict, expose),
         }
     }
@@ -391,7 +384,8 @@ impl PatchLog {
         let expose = ExposeQueue(self.expose.iter().map(|id| doc.id_to_exid(*id)).collect());
         let clock = self.heads.as_ref().map(|h| doc.clock_at(h));
         let path_map = self.get_path_map();
-        Self::make_patches_inner(&self.events, expose, path_map, doc, clock, self.text_rep)
+        let text_encoding = doc.text_encoding();
+        Self::make_patches_inner(&self.events, expose, path_map, doc, clock, text_encoding)
     }
 
     fn make_patches_inner(
@@ -400,9 +394,9 @@ impl PatchLog {
         path_map: BTreeMap<ObjId, (Prop, ObjId)>,
         doc: &Automerge,
         clock: Option<Clock>,
-        text_rep: TextRepresentation,
+        text_encoding: TextEncoding,
     ) -> Vec<Patch> {
-        let mut patch_builder = PatchBuilder::new(doc, path_map, clock.clone(), text_rep);
+        let mut patch_builder = PatchBuilder::new(doc, path_map, clock.clone(), text_encoding);
         for (obj, event) in events {
             let exid = doc.id_to_exid(obj.0);
             // ignore events on objects in the expose queue
@@ -413,7 +407,7 @@ impl PatchLog {
                 continue;
             }
             // any objects exposed BEFORE exid get observed here
-            expose_queue.pump_queue(&exid, &mut patch_builder, doc, clock.as_ref(), text_rep);
+            expose_queue.pump_queue(&exid, &mut patch_builder, doc, clock.as_ref());
             match event {
                 Event::PutMap {
                     key,
@@ -476,7 +470,7 @@ impl PatchLog {
             }
         }
         // any objects exposed AFTER all other events get exposed here
-        expose_queue.flush_queue(&mut patch_builder, doc, clock.as_ref(), text_rep);
+        expose_queue.flush_queue(&mut patch_builder, doc, clock.as_ref());
 
         patch_builder.take_patches()
     }
@@ -496,7 +490,6 @@ impl PatchLog {
             events: Default::default(),
             path_map: Default::default(),
             path_hint: 0,
-            text_rep: self.text_rep,
             heads: None,
             actors: self.actors.clone(),
         }
@@ -546,14 +539,6 @@ impl PatchLog {
         self.events.extend(other.events);
     }
 
-    pub(crate) fn text_rep(&self) -> TextRepresentation {
-        self.text_rep
-    }
-
-    pub(crate) fn set_text_rep(&mut self, rep: TextRepresentation) {
-        self.text_rep = rep;
-    }
-
     pub(crate) fn path_hint(&mut self, hint: BTreeMap<ObjId, (Prop, ObjId)>) {
         self.path_map = hint;
         self.path_hint = self.events.len();
@@ -584,13 +569,12 @@ impl ExposeQueue {
         patch_builder: &mut PatchBuilder<'_>,
         doc: &Automerge,
         clock: Option<&Clock>,
-        text_rep: TextRepresentation,
     ) {
         while let Some(exposed) = self.0.first() {
             if exposed >= obj {
                 break;
             }
-            self.flush_obj(exposed.clone(), patch_builder, doc, clock, text_rep);
+            self.flush_obj(exposed.clone(), patch_builder, doc, clock);
         }
     }
 
@@ -599,10 +583,9 @@ impl ExposeQueue {
         patch_builder: &mut PatchBuilder<'_>,
         doc: &Automerge,
         clock: Option<&Clock>,
-        text_rep: TextRepresentation,
     ) {
         while let Some(exposed) = self.0.first() {
-            self.flush_obj(exposed.clone(), patch_builder, doc, clock, text_rep);
+            self.flush_obj(exposed.clone(), patch_builder, doc, clock);
         }
     }
 
@@ -620,17 +603,16 @@ impl ExposeQueue {
         patch_builder: &mut PatchBuilder<'_>,
         doc: &Automerge,
         clock: Option<&Clock>,
-        text_rep: TextRepresentation,
     ) -> Option<()> {
         let id = exid.to_internal_obj();
         self.remove(&exid);
         match doc.ops().object_type(&id)? {
-            ObjType::Text if matches!(text_rep, TextRepresentation::String(_)) => {
+            ObjType::Text => {
                 let text = doc.text_for(&exid, clock.cloned()).ok()?;
                 // TODO - need doc, text_spans()
                 patch_builder.splice_text(exid, 0, &text, None);
             }
-            ObjType::List | ObjType::Text => {
+            ObjType::List => {
                 for item in doc.list_range_for(&exid, .., clock.cloned()) {
                     let value = item.value.to_value();
                     let id = item.id();

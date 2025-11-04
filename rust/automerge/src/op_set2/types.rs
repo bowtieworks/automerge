@@ -1,17 +1,18 @@
 use std::borrow::Cow;
 
 use crate::error::AutomergeError;
-use crate::hydrate;
-use crate::patches::TextRepresentation;
 use crate::types;
-use crate::types::{ActorId, ChangeHash, ElemId, ObjType, Prop};
+use crate::types::{ActorId, ChangeHash, ElemId, ObjType};
 use crate::value;
+use crate::{hydrate, TextEncoding};
 
 use std::cmp::Ordering;
 use std::fmt;
 
 use super::hexane::{PackError, Packable, RleCursor, ScanMeta};
-use super::meta::ValueType;
+use super::meta::{ValueMeta, ValueType};
+
+pub(crate) use super::meta::MetaCursor;
 
 /// An index into an array of actors stored elsewhere
 #[derive(Ord, PartialEq, Eq, Hash, PartialOrd, Debug, Clone, Default, Copy)]
@@ -85,23 +86,6 @@ impl fmt::Display for Action {
             Self::Mark => write!(f, "MRK"),
         }
     }
-}
-
-impl crate::types::OpType {
-    /*
-        pub(crate) fn action(&self) -> Action {
-            match self {
-                Self::Make(ObjType::Map) => Action::MakeMap,
-                Self::Put(_) => Action::Set,
-                Self::Make(ObjType::List) => Action::MakeList,
-                Self::Delete => Action::Delete,
-                Self::Make(ObjType::Text) => Action::MakeText,
-                Self::Increment(_) => Action::Increment,
-                Self::Make(ObjType::Table) => Action::MakeTable,
-                Self::MarkBegin(_, _) | Self::MarkEnd(_) => Action::Mark,
-            }
-        }
-    */
 }
 
 impl From<Action> for u64 {
@@ -192,7 +176,6 @@ impl<'a> OpType<'a> {
                 ),
                 None => Self::MarkEnd(expand),
             },
-            //_ => unreachable!("validate_action_and_value returned UnknownAction"),
         }
     }
 }
@@ -230,7 +213,7 @@ impl fmt::Display for ScalarValue<'_> {
 
 impl<'a> From<ScalarValue<'a>> for types::ScalarValue {
     fn from(s: ScalarValue<'a>) -> Self {
-        s.into_owned()
+        s.into_legacy()
     }
 }
 
@@ -284,7 +267,7 @@ impl<'a> ScalarValue<'a> {
         }
     }
 
-    pub(crate) fn into_owned(self) -> types::ScalarValue {
+    pub(crate) fn into_legacy(self) -> types::ScalarValue {
         match self {
             Self::Bytes(b) => types::ScalarValue::Bytes(b.to_vec()),
             Self::Str(s) => types::ScalarValue::Str(s.to_string().into()),
@@ -302,7 +285,7 @@ impl<'a> ScalarValue<'a> {
         }
     }
 
-    pub(crate) fn into_owned2(self) -> ScalarValue<'static> {
+    pub(crate) fn into_owned(self) -> ScalarValue<'static> {
         match self {
             Self::Bytes(b) => ScalarValue::Bytes(Cow::Owned(b.into_owned())),
             Self::Str(s) => ScalarValue::Str(Cow::Owned(s.into_owned())),
@@ -320,7 +303,7 @@ impl<'a> ScalarValue<'a> {
         }
     }
 
-    pub(super) fn from_raw(
+    pub(crate) fn from_raw(
         meta: super::meta::ValueMeta,
         raw: &'a [u8],
     ) -> Result<Self, ReadScalarError> {
@@ -348,7 +331,33 @@ impl<'a> ScalarValue<'a> {
         }
     }
 
-    pub(super) fn to_raw(&self) -> Option<Cow<'_, [u8]>> {
+    pub(crate) fn to_raw(&self) -> Option<Cow<'a, [u8]>> {
+        match self {
+            Self::Bytes(b) => Some(b.clone()),
+            Self::Str(Cow::Borrowed(s)) => Some(Cow::Borrowed(s.as_bytes())),
+            Self::Str(Cow::Owned(s)) => Some(Cow::Owned(s.as_bytes().to_vec())),
+            Self::Null => None,
+            Self::Boolean(_) => None,
+            Self::Uint(i) => {
+                let mut out = Vec::new();
+                leb128::write::unsigned(&mut out, *i).unwrap();
+                Some(Cow::Owned(out))
+            }
+            Self::Int(i) | Self::Counter(i) | Self::Timestamp(i) => {
+                let mut out = Vec::new();
+                leb128::write::signed(&mut out, *i).unwrap();
+                Some(Cow::Owned(out))
+            }
+            Self::F64(f) => {
+                let mut out = Vec::new();
+                out.extend_from_slice(&f.to_le_bytes());
+                Some(Cow::Owned(out))
+            }
+            Self::Unknown { bytes, .. } => Some(bytes.clone()),
+        }
+    }
+
+    pub(super) fn as_raw(&self) -> Option<Cow<'_, [u8]>> {
         match self {
             Self::Bytes(Cow::Borrowed(b)) => Some(Cow::Borrowed(b)),
             Self::Bytes(Cow::Owned(b)) => Some(Cow::Borrowed(b.as_slice())),
@@ -375,15 +384,9 @@ impl<'a> ScalarValue<'a> {
         }
     }
 
-    /*
-        pub(crate) fn as_i64(&self) -> i64 {
-            match self {
-                Self::Int(i) | Self::Counter(i) | Self::Timestamp(i) => *i,
-                Self::Uint(i) => *i as i64,
-                _ => 0,
-            }
-        }
-    */
+    pub(crate) fn meta(&self) -> ValueMeta {
+        ValueMeta::from(self)
+    }
 }
 
 // FIXME - this is a temporary fix - we ideally want
@@ -392,25 +395,6 @@ impl<'a> ScalarValue<'a> {
 
 impl crate::types::OpType {
     pub(crate) fn decompose(
-        self,
-    ) -> (
-        Action,
-        ScalarValue<'static>,
-        bool,
-        Option<Cow<'static, str>>,
-    ) {
-        let (a, v, x, m) = self.clone().decompose2();
-        let tmp = types::OpType::from_action_and_value(
-            a.into(),
-            v.clone().into(),
-            m.clone().map(|s| s.into()),
-            x,
-        );
-        assert_eq!(tmp, self);
-        (a, v, x, m)
-    }
-
-    pub(crate) fn decompose2(
         self,
     ) -> (
         Action,
@@ -435,21 +419,6 @@ impl crate::types::OpType {
             Self::MarkEnd(expand) => (Action::Mark, ScalarValue::Null, expand, None),
         }
     }
-
-    /*
-        pub(crate) fn to_raw(&self) -> Option<Cow<'_, [u8]>> {
-            match self {
-                Self::Put(v) => v.to_raw(),
-                Self::Increment(i) => {
-                    let mut out = Vec::new();
-                    leb128::write::signed(&mut out, *i).unwrap();
-                    Some(Cow::Owned(out))
-                }
-                Self::MarkBegin(_, crate::types::OldMarkData { value, .. }) => value.to_raw(),
-                _ => None,
-            }
-        }
-    */
 }
 
 impl crate::types::ScalarValue {
@@ -470,41 +439,6 @@ impl crate::types::ScalarValue {
             },
         }
     }
-
-    /*
-        pub(super) fn to_raw(&self) -> Option<Cow<'_, [u8]>> {
-            match self {
-                Self::Bytes(b) => Some(Cow::Borrowed(b)),
-                Self::Str(s) => Some(Cow::Borrowed(s.as_bytes())),
-                Self::Null => None,
-                Self::Boolean(_) => None,
-                Self::Uint(i) => {
-                    let mut out = Vec::new();
-                    leb128::write::unsigned(&mut out, *i).unwrap();
-                    Some(Cow::Owned(out))
-                }
-                Self::Counter(i) => {
-                    let mut out = Vec::new();
-                    leb128::write::signed(&mut out, i.start).unwrap();
-                    Some(Cow::Owned(out))
-                }
-                Self::Int(i) | Self::Timestamp(i) => {
-                    let mut out = Vec::new();
-                    leb128::write::signed(&mut out, *i).unwrap();
-                    Some(Cow::Owned(out))
-                }
-                Self::F64(f) => {
-                    let mut out = Vec::new();
-                    out.extend_from_slice(&f.to_le_bytes());
-                    Some(Cow::Owned(out))
-                }
-                Self::Unknown {
-                    type_code: _,
-                    bytes,
-                } => Some(Cow::Borrowed(bytes)),
-            }
-        }
-    */
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -536,24 +470,6 @@ fn parse_leb128(input: &[u8]) -> Result<i64, ReadScalarError> {
         .map(|(_, v)| v)
         .map_err(|_| ReadScalarError::Leb)
 }
-
-/*
-impl PartialEq<ValueRef<'_>> for types::Value<'_> {
-    fn eq(&self, other: &ValueRef<'_>) -> bool {
-      other.eq(self)
-    }
-}
-
-impl PartialEq<types::Value<'_>> for ValueRef<'_> {
-    fn eq(&self, other: &types::Value<'_>) -> bool {
-        match (self, other) {
-            (ValueRef::Object(a), types::Value::Object(b)) => *a == *b,
-            (ValueRef::Scalar(a), types::Value::Scalar(b)) => *a == **b,
-            _ => false,
-        }
-    }
-}
-*/
 
 impl PartialEq<ScalarValue<'_>> for types::ScalarValue {
     fn eq(&self, other: &ScalarValue<'_>) -> bool {
@@ -644,23 +560,8 @@ impl<'a> From<&'a str> for ScalarValue<'a> {
     }
 }
 
-#[derive(Clone, Debug, Copy, PartialEq)]
-pub(crate) enum PropRef<'a> {
-    Map(&'a str),
-    Seq(usize),
-}
-
-impl From<&PropRef<'_>> for Prop {
-    fn from(p: &PropRef<'_>) -> Prop {
-        match p {
-            PropRef::Map(s) => Prop::Map(s.to_string()),
-            PropRef::Seq(i) => Prop::Seq(*i),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PropRef2<'a> {
+pub(crate) enum PropRef<'a> {
     Map(Cow<'a, str>),
     Seq(usize),
 }
@@ -681,29 +582,9 @@ impl PartialOrd for KeyRef<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Key {
-    Map(String),
-    Seq(ElemId),
-}
-
-impl Key {}
-
-impl From<ElemId> for Key {
-    fn from(e: ElemId) -> Key {
-        Key::Seq(e)
-    }
-}
-
 impl From<ElemId> for KeyRef<'static> {
     fn from(e: ElemId) -> KeyRef<'static> {
         KeyRef::Seq(e)
-    }
-}
-
-impl From<String> for Key {
-    fn from(s: String) -> Key {
-        Key::Map(s)
     }
 }
 
@@ -784,12 +665,12 @@ impl<'a> ValueRef<'a> {
         }
     }
 
-    pub(crate) fn hydrate(self, rep: TextRepresentation) -> hydrate::Value {
+    pub(crate) fn hydrate(self, encoding: TextEncoding) -> hydrate::Value {
         match self {
             Self::Object(ObjType::Map) => hydrate::Value::map(),
             Self::Object(ObjType::Table) => hydrate::Value::map(),
             Self::Object(ObjType::List) => hydrate::Value::list(),
-            Self::Object(ObjType::Text) => hydrate::Value::text(rep, ""),
+            Self::Object(ObjType::Text) => hydrate::Value::text(encoding, ""),
             Self::Scalar(s) => hydrate::Value::Scalar(s.into()),
         }
     }
@@ -797,14 +678,14 @@ impl<'a> ValueRef<'a> {
     pub(crate) fn into_owned(self) -> ValueRef<'static> {
         match self {
             Self::Object(o) => ValueRef::Object(o),
-            Self::Scalar(s) => ValueRef::Scalar(s.into_owned2()),
+            Self::Scalar(s) => ValueRef::Scalar(s.into_owned()),
         }
     }
 
     pub fn into_value(self) -> value::Value<'static> {
         match self {
             Self::Object(o) => value::Value::Object(o),
-            Self::Scalar(s) => value::Value::Scalar(Cow::Owned(s.into_owned())),
+            Self::Scalar(s) => value::Value::Scalar(Cow::Owned(s.into_legacy())),
         }
     }
 

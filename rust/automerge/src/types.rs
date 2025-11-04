@@ -3,7 +3,7 @@ use crate::error::AutomergeError;
 use crate::legacy as amp;
 use crate::op_set2::ActorIdx;
 use rand::{
-    distributions::{Distribution, Standard},
+    distr::{Distribution, StandardUniform},
     Rng,
 };
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 use tinyvec::{ArrayVec, TinyVec};
 
-//use fnv::FnvBuildHasher;
-use fxhash::FxBuildHasher;
+use rustc_hash::FxBuildHasher;
 pub(crate) type SmallHasher = FxBuildHasher;
 pub(crate) type SmallHashMap<A, B> = HashMap<A, B, SmallHasher>;
 
@@ -53,7 +52,7 @@ impl fmt::Debug for ActorId {
     }
 }
 
-impl Distribution<ActorId> for Standard {
+impl Distribution<ActorId> for StandardUniform {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> ActorId {
         let mut bytes = [0u8; 16];
         rng.fill(&mut bytes);
@@ -64,10 +63,7 @@ impl Distribution<ActorId> for Standard {
 impl ActorId {
     pub fn random() -> ActorId {
         let mut buf = [0u8; 16];
-        // getrandom 0.3 breaks node v18
-        // keep using 0.2 until we stop supporting v18
-        //getrandom::fill(&mut buf).expect("random number generator failed"); // 0.3 interface
-        getrandom::getrandom(&mut buf).expect("random number generator failed"); // 0.2 interface
+        getrandom::fill(&mut buf).expect("random number generator failed");
         ActorId(TinyVec::from(buf))
     }
 
@@ -188,6 +184,14 @@ impl ObjType {
     pub fn is_sequence(&self) -> bool {
         matches!(self, Self::List | Self::Text)
     }
+
+    pub(crate) fn as_sequence_type(&self) -> Option<SequenceType> {
+        match self {
+            ObjType::List => Some(SequenceType::List),
+            ObjType::Text => Some(SequenceType::Text),
+            _ => None,
+        }
+    }
 }
 
 impl From<amp::MapType> for ObjType {
@@ -230,37 +234,6 @@ pub enum OpType {
 }
 
 impl OpType {
-    /*
-        /// The index into the action array as specified in [1]
-        ///
-        /// [1]: https://alexjg.github.io/automerge-storage-docs/#action-array
-        pub(crate) fn action_index(&self) -> u64 {
-            match self {
-                Self::Make(ObjType::Map) => 0,
-                Self::Put(_) => 1,
-                Self::Make(ObjType::List) => 2,
-                Self::Delete => 3,
-                Self::Make(ObjType::Text) => 4,
-                Self::Increment(_) => 5,
-                Self::Make(ObjType::Table) => 6,
-                Self::MarkBegin(_, _) | Self::MarkEnd(_) => 7,
-            }
-        }
-
-    pub(crate) fn expand(&self) -> bool {
-        matches!(self, OpType::MarkBegin(true, _) | OpType::MarkEnd(true))
-    }
-
-    pub(crate) fn value(&self) -> Cow<'_, ScalarValue> {
-        match self {
-            OpType::Put(v) => Cow::Borrowed(v),
-            OpType::Increment(i) => Cow::Owned(ScalarValue::Int(*i)),
-            OpType::MarkBegin(_, OldMarkData { value, .. }) => Cow::Borrowed(value),
-            _ => Cow::Owned(ScalarValue::Null),
-        }
-    }
-    */
-
     pub(crate) fn validate_action_and_value(
         action: u64,
         value: &ScalarValue,
@@ -276,60 +249,6 @@ impl OpType {
             _ => Err(error::InvalidOpType::UnknownAction(action)),
         }
     }
-
-    pub(crate) fn from_action_and_value(
-        action: u64,
-        value: ScalarValue,
-        mark_name: Option<smol_str::SmolStr>,
-        expand: bool,
-    ) -> OpType {
-        match action {
-            0 => Self::Make(ObjType::Map),
-            1 => Self::Put(value),
-            2 => Self::Make(ObjType::List),
-            3 => Self::Delete,
-            4 => Self::Make(ObjType::Text),
-            5 => match value {
-                ScalarValue::Int(i) => Self::Increment(i),
-                ScalarValue::Uint(i) => Self::Increment(i as i64),
-                _ => unreachable!("validate_action_and_value returned NonNumericInc"),
-            },
-            6 => Self::Make(ObjType::Table),
-            7 => match mark_name {
-                Some(name) => Self::MarkBegin(expand, OldMarkData { name, value }),
-                None => Self::MarkEnd(expand),
-            },
-            _ => unreachable!("validate_action_and_value returned UnknownAction"),
-        }
-    }
-
-    /*
-        pub(crate) fn to_str(&self) -> &str {
-            if let OpType::Put(ScalarValue::Str(s)) = &self {
-                s
-            } else if self.is_mark() {
-                ""
-            } else {
-                "\u{fffc}"
-            }
-        }
-
-        pub(crate) fn mark_name(&self) -> Option<&str> {
-            if let OpType::MarkBegin(_, data) = self {
-                Some(&data.name)
-            } else {
-                None
-            }
-        }
-
-        pub(crate) fn is_mark(&self) -> bool {
-            matches!(&self, OpType::MarkBegin(_, _) | OpType::MarkEnd(_))
-        }
-
-        pub(crate) fn is_block(&self) -> bool {
-            &OpType::Make(ObjType::Map) == self
-        }
-    */
 }
 
 impl From<ObjType> for OpType {
@@ -389,17 +308,6 @@ impl Exportable for OpId {
         Export::Id(*self)
     }
 }
-
-/*
-impl Exportable for Key {
-    fn export(&self) -> Export {
-        match self {
-            Key::Map(p) => Export::Prop(*p),
-            Key::Seq(e) => e.export(),
-        }
-    }
-}
-*/
 
 impl From<ObjId> for OpId {
     fn from(o: ObjId) -> Self {
@@ -467,43 +375,11 @@ impl From<f64> for Prop {
     }
 }
 
-/*
-impl From<OpId> for Key {
-    fn from(id: OpId) -> Self {
-        Key::Seq(ElemId(id))
-    }
-}
-*/
-
-/*
-impl From<ElemId> for Key {
-    fn from(e: ElemId) -> Self {
-        Key::Seq(e)
-    }
-}
-*/
-
 impl From<Option<ElemId>> for ElemId {
     fn from(e: Option<ElemId>) -> Self {
         e.unwrap_or(HEAD)
     }
 }
-
-/*
-impl From<Option<ElemId>> for Key {
-    fn from(e: Option<ElemId>) -> Self {
-        Key::Seq(e.into())
-    }
-}
-*/
-
-/*
-#[derive(Debug, PartialEq, PartialOrd, Eq, Ord, Clone, Copy, Hash)]
-pub(crate) enum Key {
-    Map(usize),
-    Seq(ElemId),
-}
-*/
 
 /// A property of an object
 ///
@@ -541,24 +417,6 @@ impl Display for Prop {
         }
     }
 }
-
-/*
-impl Key {
-    pub(crate) fn prop_index(&self) -> Option<usize> {
-        match self {
-            Key::Map(n) => Some(*n),
-            Key::Seq(_) => None,
-        }
-    }
-
-    pub(crate) fn elemid(&self) -> Option<ElemId> {
-        match self {
-            Key::Map(_) => None,
-            Key::Seq(id) => Some(*id),
-        }
-    }
-}
-*/
 
 // FIXME - isn't having ord and partial ord here dangerous?
 #[derive(Debug, Clone, PartialOrd, Ord, Eq, PartialEq, Copy, Hash, Default)]
@@ -695,6 +553,14 @@ impl ObjId {
         }
     }
 
+    pub(crate) fn icounter(&self) -> Option<i64> {
+        if self.is_root() {
+            None
+        } else {
+            Some(self.0.icounter())
+        }
+    }
+
     pub(crate) fn actor(&self) -> Option<ActorIdx> {
         if self.is_root() {
             None
@@ -728,11 +594,16 @@ impl ObjMeta {
     }
 }
 
+/// How the indexes into a string are counted
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TextEncoding {
+    /// Each unicode code point counts as one unit
     UnicodeCodePoint,
+    /// Each UTF-8 code unit counts as one unit (i.e. each byte in the utf-8 encoding of the string counts as one unit)
     Utf8CodeUnit,
+    /// Each utf-16 code unit counts as one unit, (i.e. each byte in the utf-16 encoding of the string counts as one unit)
     Utf16CodeUnit,
+    /// Each grapheme cluster counts as one unit
     GraphemeCluster,
 }
 
@@ -749,26 +620,10 @@ impl TextEncoding {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum ListEncoding {
-    #[default]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum SequenceType {
     List,
-    Text(TextEncoding),
-}
-
-impl From<TextEncoding> for ListEncoding {
-    fn from(enc: TextEncoding) -> Self {
-        Self::Text(enc)
-    }
-}
-
-impl ListEncoding {
-    pub(crate) fn width(&self, s: &str) -> usize {
-        match self {
-            ListEncoding::List => 1,
-            ListEncoding::Text(enc) => enc.width(s),
-        }
-    }
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, PartialOrd, Eq, PartialEq, Ord, Hash, Default)]
@@ -889,85 +744,4 @@ impl From<Prop> for wasm_bindgen::JsValue {
             Prop::Seq(index) => (index as f64).into(),
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) mod gen {
-    //use super::{ChangeHash, ElemId, ObjType, OpId, OpType, ScalarValue, HASH_SIZE};
-    //use crate::value::Counter;
-
-    //use proptest::prelude::*;
-
-    /*
-        pub(crate) fn gen_hash() -> impl Strategy<Value = ChangeHash> {
-            proptest::collection::vec(proptest::bits::u8::ANY, HASH_SIZE)
-                .prop_map(|b| ChangeHash::try_from(&b[..]).unwrap())
-        }
-
-        pub(crate) fn gen_scalar_value() -> impl Strategy<Value = ScalarValue> {
-            prop_oneof![
-                proptest::collection::vec(proptest::bits::u8::ANY, 0..200).prop_map(ScalarValue::Bytes),
-                "[a-z]{10,500}".prop_map(|s| ScalarValue::Str(s.into())),
-                any::<i64>().prop_map(ScalarValue::Int),
-                any::<u64>().prop_map(ScalarValue::Uint),
-                any::<f64>().prop_map(ScalarValue::F64),
-                any::<i64>().prop_map(|c| ScalarValue::Counter(Counter::from(c))),
-                any::<i64>().prop_map(ScalarValue::Timestamp),
-                any::<bool>().prop_map(ScalarValue::Boolean),
-                Just(ScalarValue::Null),
-            ]
-        }
-
-        pub(crate) fn gen_objtype() -> impl Strategy<Value = ObjType> {
-            prop_oneof![
-                Just(ObjType::Map),
-                Just(ObjType::Table),
-                Just(ObjType::List),
-                Just(ObjType::Text),
-            ]
-        }
-
-        pub(crate) fn gen_action() -> impl Strategy<Value = OpType> {
-            prop_oneof![
-                Just(OpType::Delete),
-                any::<i64>().prop_map(OpType::Increment),
-                gen_scalar_value().prop_map(OpType::Put),
-                gen_objtype().prop_map(OpType::Make)
-            ]
-        }
-    */
-
-    /*
-        pub(crate) fn gen_key(key_indices: Vec<usize>) -> impl Strategy<Value = Key> {
-            prop_oneof![
-                proptest::sample::select(key_indices).prop_map(Key::Map),
-                Just(Key::Seq(ElemId(OpId::new(0, 0)))),
-            ]
-        }
-    */
-
-    /*
-        /// Generate an arbitrary op
-        ///
-        /// The generated op will have no preds or succs
-        ///
-        /// # Arguments
-        ///
-        /// * `id` - the OpId this op will be given
-        /// * `key_prop_indices` - The indices of props which will be used to generate keys of type
-        ///    `Key::Map`. I.e. this is what would typically be in `OpSetMetadata::props
-        pub(crate) fn gen_op(
-            id: OpId,
-            key_prop_indices: Vec<usize>,
-        ) -> impl Strategy<Value = OpBuilder> {
-            (gen_key(key_prop_indices), any::<bool>(), gen_action()).prop_map(
-                move |(key, insert, action)| OpBuilder {
-                    id,
-                    key,
-                    insert,
-                    action,
-                },
-            )
-        }
-    */
 }

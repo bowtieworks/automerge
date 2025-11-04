@@ -1,17 +1,18 @@
 use std::ops::RangeBounds;
 
-use crate::automerge::diff;
 use crate::automerge::SaveOptions;
+use crate::clock::Clock;
 use crate::cursor::{CursorPosition, MoveCursor};
 use crate::exid::ExId;
-use crate::iter::{DocIter, Keys, ListRange, MapRange, Spans, Values};
+use crate::iter::{DiffIter, DocIter, Keys, ListRange, MapRange, Span, Spans, Values};
+use crate::marks::UpdateSpansConfig;
 use crate::marks::{ExpandMark, Mark, MarkSet};
 use crate::op_set2::{ChangeMetadata, Parents};
-use crate::patches::{PatchLog, TextRepresentation};
+use crate::patches::PatchLog;
 use crate::sync::SyncDoc;
 use crate::transaction::{CommitOptions, Transactable};
-use crate::types::Clock;
-use crate::{hydrate, OnPartialLoad, TextEncoding};
+use crate::types::ObjMeta;
+use crate::{hydrate, Bundle, OnPartialLoad, TextEncoding};
 use crate::{sync, ObjType, Patch, ReadDoc, ScalarValue, ROOT};
 use crate::{
     transaction::TransactionInner, ActorId, Automerge, AutomergeError, Change, ChangeHash, Cursor,
@@ -70,12 +71,10 @@ pub struct AutoCommit {
 /// See [`AutoCommit`]
 impl Default for AutoCommit {
     fn default() -> Self {
-        let doc = Automerge::new();
-        let text_rep = doc.text_encoding().into();
         AutoCommit {
             doc: Automerge::new(),
             transaction: None,
-            patch_log: PatchLog::inactive(text_rep),
+            patch_log: PatchLog::inactive(),
             diff_cursor: Vec::new(),
             diff_cache: None,
             save_cursor: Vec::new(),
@@ -95,11 +94,10 @@ impl AutoCommit {
 
     pub fn new_with_encoding(encoding: TextEncoding) -> AutoCommit {
         let doc = Automerge::new_with_encoding(encoding);
-        let text_rep = doc.text_encoding().into();
         AutoCommit {
             doc,
             transaction: None,
-            patch_log: PatchLog::inactive(text_rep),
+            patch_log: PatchLog::inactive(),
             diff_cursor: Vec::new(),
             diff_cache: None,
             save_cursor: Vec::new(),
@@ -109,11 +107,10 @@ impl AutoCommit {
 
     pub fn load(data: &[u8]) -> Result<Self, AutomergeError> {
         let doc = Automerge::load(data)?;
-        let text_encoding = doc.text_encoding();
         Ok(Self {
             doc,
             transaction: None,
-            patch_log: PatchLog::inactive(text_encoding.into()),
+            patch_log: PatchLog::inactive(),
             diff_cursor: Vec::new(),
             diff_cache: None,
             save_cursor: Vec::new(),
@@ -123,11 +120,10 @@ impl AutoCommit {
 
     pub fn load_unverified_heads(data: &[u8]) -> Result<Self, AutomergeError> {
         let doc = Automerge::load_unverified_heads(data)?;
-        let text_encoding = doc.text_encoding();
         Ok(Self {
             doc,
             transaction: None,
-            patch_log: PatchLog::inactive(text_encoding.into()),
+            patch_log: PatchLog::inactive(),
             diff_cursor: Vec::new(),
             diff_cache: None,
             save_cursor: Vec::new(),
@@ -154,11 +150,10 @@ impl AutoCommit {
         options: LoadOptions<'_>,
     ) -> Result<Self, AutomergeError> {
         let doc = Automerge::load_with_options(data, options)?;
-        let text_encoding = doc.text_encoding();
         Ok(Self {
             doc,
             transaction: None,
-            patch_log: PatchLog::inactive(text_encoding.into()),
+            patch_log: PatchLog::inactive(),
             diff_cursor: Vec::new(),
             diff_cache: None,
             save_cursor: Vec::new(),
@@ -170,7 +165,7 @@ impl AutoCommit {
     /// longer indexes changes to the document.
     pub fn reset_diff_cursor(&mut self) {
         self.ensure_transaction_closed();
-        self.patch_log = PatchLog::inactive(self.doc.text_encoding().into());
+        self.patch_log = PatchLog::inactive();
         self.diff_cursor = Vec::new();
     }
 
@@ -253,7 +248,7 @@ impl AutoCommit {
         {
             self.patch_log.make_patches(&self.doc)
         } else if range.before().is_empty() && range.after() == heads {
-            let mut patch_log = PatchLog::active(self.patch_log.text_rep());
+            let mut patch_log = PatchLog::active();
             // This if statement is only active if the current heads are the same as `after`
             // so we don't need to tell the patch log to target a specific heads and consequently
             // it wll be able to generate patches very fast as it doesn't need to make any clocks
@@ -261,11 +256,10 @@ impl AutoCommit {
             self.doc.log_current_state(&mut patch_log);
             patch_log.make_patches(&self.doc)
         } else {
-            let before_clock = self.doc.clock_at(range.before());
-            let after_clock = self.doc.clock_at(range.after());
-            let mut patch_log = PatchLog::active(self.patch_log.text_rep());
+            let clock = self.doc.clock_range(range.before(), range.after());
+            let mut patch_log = PatchLog::active();
             patch_log.heads = Some(range.after().to_vec());
-            diff::log_diff(&self.doc, &before_clock, &after_clock, &mut patch_log);
+            DiffIter::log(&self.doc, ObjMeta::root(), clock, &mut patch_log);
             patch_log.make_patches(&self.doc)
         };
         self.diff_cache = Some((range, patches));
@@ -296,7 +290,7 @@ impl AutoCommit {
         Self {
             doc: self.doc.fork(),
             transaction: self.transaction.clone(),
-            patch_log: PatchLog::inactive(self.patch_log.text_rep()),
+            patch_log: PatchLog::inactive(),
             diff_cursor: vec![],
             diff_cache: None,
             save_cursor: vec![],
@@ -309,7 +303,7 @@ impl AutoCommit {
         Ok(Self {
             doc: self.doc.fork_at(heads)?,
             transaction: self.transaction.clone(),
-            patch_log: PatchLog::inactive(self.patch_log.text_rep()),
+            patch_log: PatchLog::inactive(),
             diff_cursor: vec![],
             diff_cache: None,
             save_cursor: vec![],
@@ -455,6 +449,21 @@ impl AutoCommit {
         Ok(bytes)
     }
 
+    /// EXPERIMENTAL: Write the set of changes in `hashes` to a "bundle"
+    ///
+    /// A "bundle" is a compact representation of a set of changes which uses
+    /// the same compression tricks as the document encoding we use in
+    /// [`Automerge::save`].
+    ///
+    /// This is an experimental API, the bundle format is still subject to change
+    /// and so should not be used in production just yet.
+    pub fn bundle<I>(&self, hashes: I) -> Result<Bundle, AutomergeError>
+    where
+        I: IntoIterator<Item = ChangeHash>,
+    {
+        self.doc.bundle(hashes)
+    }
+
     #[cfg(test)]
     pub fn debug_cmp(&self, other: &Self) {
         self.doc.debug_cmp(&other.doc);
@@ -564,19 +573,6 @@ impl AutoCommit {
         }
     }
 
-    pub fn set_text_rep(&mut self, text_rep: TextRepresentation) {
-        self.patch_log.set_text_rep(text_rep)
-    }
-
-    pub fn get_text_rep(&mut self) -> TextRepresentation {
-        self.patch_log.text_rep()
-    }
-
-    pub fn with_text_rep(mut self, text_rep: TextRepresentation) -> Self {
-        self.patch_log.set_text_rep(text_rep);
-        self
-    }
-
     /// Commit any uncommitted changes
     ///
     /// Returns [`None`] if there were no operations to commit
@@ -673,9 +669,8 @@ impl AutoCommit {
         // we may be isolated so we dont use self.doc.get_heads()
         let before = self.get_heads();
         if before.as_slice() != after {
-            let before_clock = self.doc.clock_at(&before);
-            let after_clock = self.doc.clock_at(after);
-            diff::log_diff(&self.doc, &before_clock, &after_clock, &mut self.patch_log);
+            let clock = self.doc.clock_range(&before, after);
+            DiffIter::log(&self.doc, ObjMeta::root(), clock, &mut self.patch_log);
         }
     }
 
@@ -708,19 +703,12 @@ impl ReadDoc for AutoCommit {
         self.doc.keys_for(obj.as_ref(), self.get_scope(Some(heads)))
     }
 
-    fn iter_at<O: AsRef<ExId>>(
-        &self,
-        obj: O,
-        heads: Option<&[ChangeHash]>,
-        text_rep: TextRepresentation,
-    ) -> DocIter<'_> {
-        self.doc
-            .iter_for(obj.as_ref(), self.get_scope(heads), text_rep)
+    fn iter_at<O: AsRef<ExId>>(&self, obj: O, heads: Option<&[ChangeHash]>) -> DocIter<'_> {
+        self.doc.iter_for(obj.as_ref(), self.get_scope(heads))
     }
 
     fn iter(&self) -> DocIter<'_> {
-        self.doc
-            .iter_for(&ROOT, self.get_scope(None), self.patch_log.text_rep())
+        self.doc.iter_for(&ROOT, self.get_scope(None))
     }
 
     fn map_range<'a, O: AsRef<ExId>, R: RangeBounds<String> + 'a>(
@@ -1103,14 +1091,22 @@ impl Transactable for AutoCommit {
         crate::text_diff::myers_diff(&mut self.doc, tx, patch_log, obj, new_text)
     }
 
-    fn update_spans<'a, O: AsRef<ExId>, I: IntoIterator<Item = crate::BlockOrText<'a>>>(
+    fn update_spans<O: AsRef<ExId>, I: IntoIterator<Item = Span>>(
         &mut self,
         text: O,
+        config: UpdateSpansConfig,
         new_text: I,
     ) -> Result<(), AutomergeError> {
         self.ensure_transaction_open();
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
-        crate::text_diff::myers_block_diff(&mut self.doc, tx, patch_log, text.as_ref(), new_text)
+        crate::text_diff::myers_block_diff(
+            &mut self.doc,
+            tx,
+            patch_log,
+            text.as_ref(),
+            new_text,
+            &config,
+        )
     }
 
     fn update_object<O: AsRef<ExId>>(

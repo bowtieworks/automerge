@@ -1,9 +1,7 @@
-use automerge::patches::TextRepresentation;
 use automerge::transaction::CommitOptions;
 use automerge::transaction::Transactable;
 use automerge::Automerge;
 use automerge::AutomergeError;
-use automerge::TextEncoding;
 use automerge::ROOT;
 use automerge::{Patch, PatchAction, PatchLog};
 
@@ -13,7 +11,6 @@ fn main() {
     // a simple scalar change in the root object
     let mut result = doc
         .transact_and_log_patches_with::<_, _, AutomergeError, _>(
-            TextRepresentation::String(TextEncoding::default()),
             |_result| CommitOptions::default(),
             |tx| {
                 tx.put(ROOT, "hello", "world").unwrap();
@@ -23,9 +20,7 @@ fn main() {
         .unwrap();
     get_changes(&doc, doc.make_patches(&mut result.patch_log));
 
-    let mut tx = doc.transaction_log_patches(PatchLog::active(TextRepresentation::String(
-        TextEncoding::default(),
-    )));
+    let mut tx = doc.transaction_log_patches(PatchLog::active());
     let map = tx
         .put_object(ROOT, "my new map", automerge::ObjType::Map)
         .unwrap();

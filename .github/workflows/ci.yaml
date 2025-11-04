@@ -10,11 +10,11 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: 1.86
+          toolchain: 1.89
           default: true
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -24,11 +24,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: 1.86
+          toolchain: 1.89
           default: true
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -38,11 +38,11 @@ jobs:
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: 1.86
+          toolchain: 1.89
           default: true
       - uses: Swatinem/rust-cache@v2
       - name: Build rust docs
@@ -61,7 +61,7 @@ jobs:
           - bans licenses sources
     continue-on-error: ${{ matrix.checks == 'advisories' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: "./rust/Cargo.toml"
@@ -70,11 +70,11 @@ jobs:
   build_wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: jetli/wasm-bindgen-action@v0.2.0
         with:
           # Optional version of wasm-bindgen to install(eg. '0.2.83', 'latest')
-          version: "0.2.100"
+          version: "0.2.104"
       - name: Install wasm32 target
         working-directory: rust
         run: rustup target add wasm32-unknown-unknown
@@ -87,28 +87,50 @@ jobs:
       - build_wasm
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: "24"
       - uses: jetli/wasm-bindgen-action@v0.2.0
         with:
           # Optional version of wasm-bindgen to install(eg. '0.2.83', 'latest')
-          version: "0.2.100"
+          version: "0.2.104"
       - name: Install wasm32 target
         working-directory: rust
         run: rustup target add wasm32-unknown-unknown
       - name: run tests
         run: ./scripts/ci/js_tests
 
+  # This test is necessary because we want to make sure that the webcrypto polyfill
+  # for node 18 works correctly. See the notes in javascript/HACKING.md#getrandom-support
+  node_18_packaging_test:
+    runs-on: ubuntu-latest
+    needs:
+      - build_wasm
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "18"
+      - uses: jetli/wasm-bindgen-action@v0.2.0
+        with:
+          # Optional version of wasm-bindgen to install(eg. '0.2.83', 'latest')
+          version: "0.2.104"
+      - name: Install wasm32 target
+        working-directory: rust
+        run: rustup target add wasm32-unknown-unknown
+      - name: run tests
+        run: ./scripts/ci/node_18_packaging_test
+
   linux:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         toolchain:
-          - 1.86
+          - 1.89
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -121,11 +143,11 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: 1.86
+          toolchain: 1.89
           default: true
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/ci/build-test
@@ -134,11 +156,11 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: 1.86
+          toolchain: 1.89
           default: true
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/ci/build-test

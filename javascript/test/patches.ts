@@ -103,14 +103,18 @@ describe("patches", () => {
 
       const goodAfter = Automerge.getHeads(doc)
 
-      assert.throws(
-        () => Automerge.diff(doc, null as any, goodAfter),
-        /before must be an array/,
-      )
-      assert.throws(
-        () => Automerge.diff(doc, goodBefore, null as any),
-        /after must be an array/,
-      )
+      let invalidInputs = [null, "", "ab", ["ab"]]
+
+      for (const invalidInput of invalidInputs) {
+        assert.throws(
+          () => Automerge.diff(doc, invalidInput as any, goodAfter),
+          /invalid before heads/,
+        )
+        assert.throws(
+          () => Automerge.diff(doc, goodBefore, invalidInput as any),
+          /invalid after heads/,
+        )
+      }
     })
   })
 
@@ -167,18 +171,7 @@ describe("patches", () => {
 
   describe("the applyPatches function", () => {
     describe("when applying to an automerge document", () => {
-      it("should apply a map update patch to the root", () => {
-        let doc = Automerge.from<{ foo: string }>({ foo: "bar" })
-        const patch: Patch = {
-          action: "put",
-          path: ["foo"],
-          value: "baz",
-        }
-        doc = Automerge.change(doc, d => Automerge.applyPatches(d, [patch]))
-        assert.deepStrictEqual(doc.foo, "baz")
-      })
-
-      it("should apply a map update to a nested map", () => {
+      it("should apply a map update", () => {
         let doc = Automerge.from<{ foo: { bar: string } }>({
           foo: { bar: "baz" },
         })
@@ -329,17 +322,6 @@ describe("patches", () => {
     })
 
     describe("when applying to a vanilla javascript object", () => {
-      it("should apply a map update patch to the root", () => {
-        let doc = { foo: "bar" }
-        const patch: Patch = {
-          action: "put",
-          path: ["foo"],
-          value: "baz",
-        }
-        Automerge.applyPatches(doc, [patch])
-        assert.deepStrictEqual(doc, { foo: "baz" })
-      })
-
       it("should apply a map update to a nested map", () => {
         let doc = { foo: { bar: "baz" } }
         const patch: Patch = {
@@ -468,6 +450,19 @@ describe("patches", () => {
           end: 2,
         }
         Automerge.applyPatches(doc, [patch])
+      })
+
+      it("should apply a map update to a map in a list in a map in a list", () => {
+        let doc = Automerge.from<{ foo: { bar: { foo: string }[] }[] }>({
+          foo: [{ bar: [{ foo: "hehe" }] }],
+        })
+        const patch: Patch = {
+          action: "put",
+          path: ["foo", 0, "bar", 0, "foo"],
+          value: "qux",
+        }
+        doc = Automerge.change(doc, d => Automerge.applyPatches(d, [patch]))
+        assert.deepStrictEqual(doc.foo[0].bar[0].foo, "qux")
       })
     })
   })

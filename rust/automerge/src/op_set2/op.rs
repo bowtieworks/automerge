@@ -1,17 +1,14 @@
 use super::hexane::{ColumnDataIter, DeltaCursor, IntCursor};
-use super::op_set::{MarkIndexBuilder, ObjInfo, OpSet};
-use super::types::{
-    Action, ActorCursor, ActorIdx, KeyRef, MarkData, OpType, PropRef, PropRef2, ScalarValue,
-};
+use super::op_set::{MarkIndexBuilder, ObjInfo, OpSet, ResolvedAction};
+use super::types::{Action, ActorCursor, ActorIdx, KeyRef, MarkData, OpType, PropRef, ScalarValue};
 use super::{ValueMeta, ValueRef};
 
 use crate::clock::Clock;
 use crate::error::AutomergeError;
 use crate::exid::ExId;
-use crate::hydrate;
-use crate::patches::TextRepresentation;
 use crate::types;
-use crate::types::{ElemId, ListEncoding, ObjId, ObjMeta, ObjType, OpId};
+use crate::types::{ElemId, ObjId, ObjMeta, ObjType, OpId, SequenceType};
+use crate::{hydrate, TextEncoding};
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -61,17 +58,17 @@ pub(crate) struct ChangeOp {
 }
 
 impl ChangeOp {
-    pub(crate) fn prop2_static(&self) -> Option<PropRef2<'static>> {
+    pub(crate) fn prop_static(&self) -> Option<PropRef<'static>> {
         match &self.bld.key {
-            KeyRef::Map(s) => Some(PropRef2::Map(Cow::Owned(String::from(s.as_ref())))),
+            KeyRef::Map(s) => Some(PropRef::Map(Cow::Owned(String::from(s.as_ref())))),
             _ => None,
         }
     }
 
-    pub(crate) fn prop2(&self) -> Option<PropRef2<'_>> {
+    pub(crate) fn prop(&self) -> Option<PropRef<'_>> {
         match &self.bld.key {
-            KeyRef::Map(Cow::Owned(s)) => Some(PropRef2::Map(Cow::Borrowed(s))),
-            KeyRef::Map(Cow::Borrowed(s)) => Some(PropRef2::Map(Cow::Borrowed(s))),
+            KeyRef::Map(Cow::Owned(s)) => Some(PropRef::Map(Cow::Borrowed(s))),
+            KeyRef::Map(Cow::Borrowed(s)) => Some(PropRef::Map(Cow::Borrowed(s))),
             _ => None,
         }
     }
@@ -82,13 +79,13 @@ impl ChangeOp {
         Some(MarkData { name, value })
     }
 
-    pub(crate) fn hydrate_value(&self, text_rep: TextRepresentation) -> hydrate::Value {
-        self.bld.hydrate_value(text_rep)
+    pub(crate) fn hydrate_value(&self, text_encoding: TextEncoding) -> hydrate::Value {
+        self.bld.hydrate_value(text_encoding)
     }
 
     pub(crate) fn hydrate_value_and_fix_counters(
         &self,
-        text_rep: TextRepresentation,
+        text_encoding: TextEncoding,
     ) -> hydrate::Value {
         if self.bld.action == Action::Set {
             if let ScalarValue::Counter(c) = &self.bld.value {
@@ -98,12 +95,12 @@ impl ChangeOp {
                 hydrate::Value::Scalar(self.bld.value.to_owned())
             }
         } else {
-            self.bld.hydrate_value(text_rep)
+            self.bld.hydrate_value(text_encoding)
         }
     }
 
-    pub(crate) fn width(&self, encoding: ListEncoding) -> usize {
-        self.bld.width(encoding)
+    pub(crate) fn width(&self, seq_type: SequenceType, text_encoding: TextEncoding) -> usize {
+        self.bld.width(seq_type, text_encoding)
     }
 
     pub(crate) fn visible(&self) -> bool {
@@ -169,6 +166,7 @@ pub(crate) struct TxOp {
     pub(crate) obj_type: ObjType,
     pub(crate) index: usize,
     pub(crate) pos: usize,
+    pub(crate) noop: bool,
     pub(crate) bld: OpBuilder<'static>,
 }
 
@@ -190,7 +188,7 @@ impl OpBuilder<'_> {
         match (self.action, &self.mark_name) {
             (Action::Mark, Some(name)) => {
                 let name = Cow::Owned(name.to_string());
-                let value = self.value.clone().into_owned2();
+                let value = self.value.clone().into_owned();
                 let data = MarkData { name, value };
                 Some(MarkIndexBuilder::Start(self.id, data))
             }
@@ -199,11 +197,11 @@ impl OpBuilder<'_> {
         }
     }
 
-    pub(crate) fn width(&self, encoding: ListEncoding) -> usize {
-        match encoding {
-            ListEncoding::List => 1,
-            ListEncoding::Text(_) if self.is_mark() => 0,
-            ListEncoding::Text(enc) => enc.width(self.as_str()),
+    pub(crate) fn width(&self, seq_type: SequenceType, text_encoding: TextEncoding) -> usize {
+        match seq_type {
+            SequenceType::List => 1,
+            SequenceType::Text if self.is_mark() => 0,
+            SequenceType::Text => text_encoding.width(self.as_str()),
         }
     }
 
@@ -235,14 +233,14 @@ impl OpBuilder<'_> {
         }
     }
 
-    pub(crate) fn hydrate_value(&self, text_rep: TextRepresentation) -> hydrate::Value {
+    pub(crate) fn hydrate_value(&self, text_encoding: TextEncoding) -> hydrate::Value {
         // FIXME
         match self.action {
             Action::Set => hydrate::Value::Scalar(self.value.to_owned()),
             Action::MakeMap => hydrate::Value::map(),
             Action::MakeList => hydrate::Value::list(),
-            Action::MakeText => hydrate::Value::new(ObjType::Text, text_rep),
-            Action::MakeTable => hydrate::Value::new(ObjType::Table, text_rep),
+            Action::MakeText => hydrate::Value::new(ObjType::Text, text_encoding),
+            Action::MakeTable => hydrate::Value::new(ObjType::Table, text_encoding),
             //Action::Mark if self.mark_name.is_some() => hydrate::Value::new(&self.value, text_rep),
             //Action::Mark => hydrate::Value::Scalar("markEnd".into()),
             _ => panic!("cant convert op into a value"),
@@ -255,20 +253,26 @@ impl TxOp {
         self.bld.id
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn list(
         id: OpId,
         obj: ObjMeta,
         pos: usize,
         index: usize,
-        _action: types::OpType,
+        action: ResolvedAction,
         elemid: ElemId,
         pred: Vec<OpId>,
     ) -> Self {
-        let (action, value, expand, mark_name) = _action.clone().decompose();
+        let (op_type, noop) = match action {
+            ResolvedAction::ConflictResolution(action) => (action, true),
+            ResolvedAction::VisibleUpdate(action) => (action, false),
+        };
+        let (action, value, expand, mark_name) = op_type.decompose();
         TxOp {
             obj_type: obj.typ,
             pos,
             index,
+            noop,
             bld: OpBuilder {
                 id,
                 obj: obj.id,
@@ -287,15 +291,20 @@ impl TxOp {
         id: OpId,
         obj: ObjMeta,
         pos: usize,
-        _action: types::OpType,
+        action: ResolvedAction,
         prop: String,
         pred: Vec<OpId>,
     ) -> Self {
-        let (action, value, expand, mark_name) = _action.clone().decompose();
+        let (action, noop) = match action {
+            ResolvedAction::ConflictResolution(action) => (action, true),
+            ResolvedAction::VisibleUpdate(action) => (action, false),
+        };
+        let (action, value, expand, mark_name) = action.clone().decompose();
         TxOp {
             obj_type: obj.typ,
             index: 0,
             pos,
+            noop,
             bld: OpBuilder {
                 id,
                 obj: obj.id,
@@ -323,6 +332,7 @@ impl TxOp {
             obj_type: obj.typ,
             pos,
             index,
+            noop: false,
             bld: OpBuilder {
                 id,
                 obj: obj.id,
@@ -350,6 +360,7 @@ impl TxOp {
             pos,
             index: 0,
             obj_type: obj.typ,
+            noop: false,
             bld: OpBuilder {
                 id,
                 obj: obj.id,
@@ -378,6 +389,7 @@ impl TxOp {
             obj_type: obj.typ,
             pos,
             index,
+            noop: false,
             bld: OpBuilder {
                 id,
                 obj: obj.id,
@@ -405,6 +417,7 @@ impl TxOp {
             obj_type: obj.typ,
             pos: 0,
             index,
+            noop: false,
             bld: OpBuilder {
                 id,
                 obj: obj.id,
@@ -421,14 +434,14 @@ impl TxOp {
 
     pub(crate) fn prop(&self) -> PropRef<'_> {
         if let KeyRef::Map(s) = &self.bld.key {
-            PropRef::Map(s)
+            PropRef::Map(s.clone())
         } else {
             PropRef::Seq(self.index)
         }
     }
 
-    pub(crate) fn hydrate_value(&self, text_rep: TextRepresentation) -> hydrate::Value {
-        self.bld.hydrate_value(text_rep)
+    pub(crate) fn hydrate_value(&self, text_encoding: TextEncoding) -> hydrate::Value {
+        self.bld.hydrate_value(text_encoding)
     }
 
     pub(crate) fn get_increment_value(&self) -> Option<i64> {
@@ -458,8 +471,8 @@ impl OpLike for &TxOp {
         op.bld.mark_index()
     }
 
-    fn width(op: &Self, encoding: ListEncoding) -> u64 {
-        op.bld.width(encoding) as u64
+    fn width(op: &Self, seq_type: SequenceType, text_encoding: TextEncoding) -> u64 {
+        op.bld.width(seq_type, text_encoding) as u64
     }
 
     fn visible(op: &Self) -> bool {
@@ -514,7 +527,7 @@ impl OpLike for &TxOp {
     }
 
     fn raw_value(&self) -> Option<Cow<'_, [u8]>> {
-        self.as_builder().value.to_raw()
+        self.as_builder().value.as_raw()
     }
     fn meta_value(&self) -> ValueMeta {
         ValueMeta::from(&self.as_builder().value)
@@ -537,8 +550,8 @@ impl OpLike for TxOp {
         op.bld.mark_index()
     }
 
-    fn width(op: &Self, encoding: ListEncoding) -> u64 {
-        op.bld.width(encoding) as u64
+    fn width(op: &Self, seq_type: SequenceType, text_encoding: TextEncoding) -> u64 {
+        op.bld.width(seq_type, text_encoding) as u64
     }
 
     fn visible(op: &Self) -> bool {
@@ -593,7 +606,7 @@ impl OpLike for TxOp {
     }
 
     fn raw_value(&self) -> Option<Cow<'_, [u8]>> {
-        self.as_builder().value.to_raw()
+        self.as_builder().value.as_raw()
     }
     fn meta_value(&self) -> ValueMeta {
         ValueMeta::from(&self.as_builder().value)
@@ -616,9 +629,9 @@ impl OpLike for ChangeOp {
         op.bld.mark_index()
     }
 
-    fn width(op: &Self, encoding: ListEncoding) -> u64 {
+    fn width(op: &Self, seq_type: SequenceType, text_encoding: TextEncoding) -> u64 {
         if Self::visible(op) {
-            op.bld.width(encoding) as u64
+            op.bld.width(seq_type, text_encoding) as u64
         } else {
             0
         }
@@ -679,7 +692,7 @@ impl OpLike for ChangeOp {
     }
 
     fn raw_value(&self) -> Option<Cow<'_, [u8]>> {
-        self.as_builder().value.to_raw()
+        self.as_builder().value.as_raw()
     }
     fn meta_value(&self) -> ValueMeta {
         ValueMeta::from(&self.as_builder().value)
@@ -725,8 +738,8 @@ impl<'a> OpLike for Op<'a> {
         op.mark_index()
     }
 
-    fn width(op: &Self, encoding: ListEncoding) -> u64 {
-        op.width(encoding) as u64
+    fn width(op: &Self, seq_type: SequenceType, text_encoding: TextEncoding) -> u64 {
+        op.width(seq_type, text_encoding) as u64
     }
 
     fn visible(_op: &Self) -> bool {
@@ -771,7 +784,7 @@ impl<'a> OpLike for Op<'a> {
     }
 
     fn raw_value(&self) -> Option<Cow<'_, [u8]>> {
-        self.value.to_raw()
+        self.value.as_raw()
     }
 
     fn meta_value(&self) -> ValueMeta {
@@ -840,6 +853,7 @@ impl std::fmt::Debug for SuccCursors<'_> {
 }
 
 pub(crate) struct SuccIncCursors<'a>(SuccCursors<'a>);
+
 struct IncCursors<'a>(SuccCursors<'a>);
 
 impl Iterator for SuccCursors<'_> {
@@ -914,7 +928,7 @@ impl<'a> Op<'a> {
         match (&self.action, &self.mark_name) {
             (Action::Mark, Some(name)) => {
                 let name = Cow::Owned(name.to_string());
-                let value = self.value.clone().into_owned2();
+                let value = self.value.clone().into_owned();
                 let data = MarkData { name, value };
                 Some(MarkIndexBuilder::Start(self.id, data))
             }
@@ -974,11 +988,11 @@ impl<'a> Op<'a> {
         }
     }
 
-    pub(crate) fn width(&self, encoding: ListEncoding) -> usize {
-        match encoding {
-            ListEncoding::List => 1,
-            ListEncoding::Text(_) if self.action == Action::Mark => 0,
-            ListEncoding::Text(enc) => enc.width(self.as_str()),
+    pub(crate) fn width(&self, seq_type: SequenceType, text_encoding: TextEncoding) -> usize {
+        match seq_type {
+            SequenceType::List => 1,
+            SequenceType::Text if self.action == Action::Mark => 0,
+            SequenceType::Text => text_encoding.width(self.as_str()),
         }
     }
 
@@ -1063,17 +1077,6 @@ impl<'a> Op<'a> {
         }
     }
 
-    pub(crate) fn is_put(&self) -> bool {
-        self.action == Action::Set
-    }
-
-    pub(crate) fn is_make(&self) -> bool {
-        matches!(
-            self.action,
-            Action::MakeMap | Action::MakeList | Action::MakeText | Action::MakeTable
-        )
-    }
-
     pub(crate) fn value(&self) -> ValueRef<'a> {
         match &self.action() {
             OpType::Make(obj_type) => ValueRef::Object(*obj_type),
@@ -1086,11 +1089,11 @@ impl<'a> Op<'a> {
         }
     }
 
-    pub(crate) fn hydrate_value(&self, text_rep: TextRepresentation) -> hydrate::Value {
+    pub(crate) fn hydrate_value(&self, text_encoding: TextEncoding) -> hydrate::Value {
         match &self.action() {
-            OpType::Make(obj_type) => hydrate::Value::new(*obj_type, text_rep),
+            OpType::Make(obj_type) => hydrate::Value::new(*obj_type, text_encoding),
             OpType::Put(scalar) => hydrate::Value::Scalar(scalar.to_owned()),
-            OpType::MarkBegin(_, mark) => hydrate::Value::new(&mark.value, text_rep),
+            OpType::MarkBegin(_, mark) => hydrate::Value::new(&mark.value, text_encoding),
             OpType::MarkEnd(_) => hydrate::Value::Scalar("markEnd".into()),
             _ => panic!("cant convert op into a value"),
         }
@@ -1098,10 +1101,6 @@ impl<'a> Op<'a> {
 
     pub(crate) fn action(&self) -> OpType<'a> {
         self.op_type()
-    }
-
-    pub(crate) fn is_noop(&self, action: &types::OpType) -> bool {
-        matches!((&self.action(), action), (OpType::Put(n), types::OpType::Put(m)) if n == m)
     }
 
     pub(crate) fn is_inc(&self) -> bool {
@@ -1116,7 +1115,7 @@ impl<'a> Op<'a> {
         self.action == Action::Mark
     }
 
-    pub(crate) fn build3(self, pred: Vec<OpId>) -> OpBuilder<'a> {
+    pub(crate) fn build(self, pred: Vec<OpId>) -> OpBuilder<'a> {
         OpBuilder {
             id: self.id,
             obj: self.obj,
@@ -1156,9 +1155,9 @@ impl<'a> Op<'a> {
         }
     }
 
-    pub(crate) fn prop2(&self) -> Option<PropRef2<'a>> {
+    pub(crate) fn prop(&self) -> Option<PropRef<'a>> {
         let key_str = self.key.key_str()?;
-        Some(PropRef2::Map(key_str))
+        Some(PropRef::Map(key_str))
     }
 }
 
@@ -1285,7 +1284,7 @@ impl<B: AsBuilder> AsChangeOp for B {
         Some(Cow::Owned(op.as_builder().action))
     }
     fn value(op: &Self) -> Option<Cow<'_, [u8]>> {
-        op.as_builder().value.to_raw()
+        op.as_builder().value.as_raw()
     }
     fn value_meta(op: &Self) -> Option<Cow<'_, ValueMeta>> {
         Some(Cow::Owned(ValueMeta::from(&op.as_builder().value)))
@@ -1338,7 +1337,7 @@ pub(crate) trait OpLike: Debug {
     fn succ_inc(op: &Self) -> Box<dyn Iterator<Item = Option<i64>> + '_>;
     fn mark_name(op: &Self) -> Option<Cow<'_, str>>;
     fn mark_index(op: &Self) -> Option<MarkIndexBuilder>;
-    fn width(op: &Self, encoding: ListEncoding) -> u64;
+    fn width(op: &Self, seq_type: SequenceType, text_encoding: TextEncoding) -> u64;
     fn visible(op: &Self) -> bool;
     fn top(op: &Self) -> bool {
         Self::visible(op)

@@ -32,9 +32,10 @@ use am::ScalarValue;
 use am::StringMigration;
 use am::VerificationMode;
 use automerge as am;
-use automerge::patches::TextRepresentation;
 use automerge::TextEncoding;
 use automerge::{sync::SyncDoc, AutoCommit, Change, Prop, ReadDoc, Value, ROOT};
+use interop::import_scalar;
+use js_sys::Reflect;
 use js_sys::{Array, Function, Object, Uint8Array};
 use serde::ser::Serialize;
 use std::borrow::Cow;
@@ -354,6 +355,11 @@ export interface JsSyncState {
   sentHashes: Heads;
 }
 
+export interface DecodedBundle {
+  changes: DecodedChange[];
+  deps: Heads;
+}
+
 export interface API {
   create(options?: InitOptions): Automerge;
   load(data: Uint8Array, options?: LoadOptions): Automerge;
@@ -366,6 +372,7 @@ export interface API {
   decodeSyncState(data: Uint8Array): SyncState;
   exportSyncState(state: SyncState): JsSyncState;
   importSyncState(state: JsSyncState): SyncState;
+  readBundle(data: Uint8Array): DecodedBundle;
 }
 
 export interface Stats {
@@ -375,8 +382,12 @@ export interface Stats {
   cargoPackageName: string;
   cargoPackageVersion: string;
   rustcVersion: string;
-};
+}
 
+export type UpdateSpansConfig = {
+    defaultExpand?: "before" | "after" | "both" | "none";
+    perMarkExpand?: {[key: string]: "before" | "after" | "both" | "none" }
+}
 "#;
 
 #[allow(unused_macros)]
@@ -397,8 +408,7 @@ pub struct Automerge {
 #[wasm_bindgen]
 impl Automerge {
     pub fn new(actor: Option<String>) -> Result<Automerge, error::BadActorId> {
-        let mut doc = AutoCommit::default()
-            .with_text_rep(TextRepresentation::String(TextEncoding::Utf16CodeUnit));
+        let mut doc = AutoCommit::new_with_encoding(TextEncoding::Utf16CodeUnit);
         if let Some(a) = actor {
             let a = automerge::ActorId::from(hex::decode(a)?.to_vec());
             doc.set_actor(a);
@@ -488,7 +498,7 @@ impl Automerge {
 
     // skip_typescript as the optional heads parameter can't be typed
     #[wasm_bindgen(skip_typescript)]
-    pub fn keys(&self, obj: JsValue, heads: Option<Array>) -> Result<Array, error::Get> {
+    pub fn keys(&self, obj: JsValue, heads: JsValue) -> Result<Array, error::Get> {
         let (obj, _) = self.import(obj)?;
         let result = if let Some(heads) = get_heads(heads)? {
             self.doc
@@ -503,7 +513,7 @@ impl Automerge {
 
     // skip_typescript as the optional heads parameter can't be typed
     #[wasm_bindgen(skip_typescript)]
-    pub fn text(&self, obj: JsValue, heads: Option<Array>) -> Result<String, error::Get> {
+    pub fn text(&self, obj: JsValue, heads: JsValue) -> Result<String, error::Get> {
         let (obj, _) = self.import(obj)?;
         if let Some(heads) = get_heads(heads)? {
             Ok(self.doc.text_at(&obj, &heads)?)
@@ -514,7 +524,7 @@ impl Automerge {
 
     // skip_typescript as the optional heads parameter can't be typed
     #[wasm_bindgen(skip_typescript)]
-    pub fn spans(&self, obj: JsValue, heads: Option<Array>) -> Result<Array, error::GetSpans> {
+    pub fn spans(&self, obj: JsValue, heads: JsValue) -> Result<Array, error::GetSpans> {
         let (obj, _) = self.import(obj)?;
         let spans = if let Some(heads) = get_heads(heads)? {
             self.doc.spans_at(&obj, &heads)?
@@ -550,10 +560,8 @@ impl Automerge {
         } else {
             let mut vals = vec![];
             if let Ok(array) = text.dyn_into::<Array>() {
-                for (index, i) in array.iter().enumerate() {
-                    let value = self
-                        .import_scalar(&i, None)
-                        .ok_or(error::Splice::ValueNotPrimitive(index))?;
+                for i in array.iter() {
+                    let value = import_scalar(&i, None)?;
                     vals.push(value);
                 }
             }
@@ -600,13 +608,16 @@ impl Automerge {
         &mut self,
         #[wasm_bindgen(unchecked_param_type = "ObjID")] obj: JsValue,
         #[wasm_bindgen(unchecked_param_type = "Span[]")] args: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "UpdateSpansConfig | undefined | null")]
+        config: JsValue,
     ) -> Result<(), error::UpdateSpans> {
         let (obj, obj_type) = self.import(obj)?;
         if !matches!(obj_type, am::ObjType::Text) {
             return Err(error::UpdateSpans::ObjectNotText);
         }
         let args = interop::import_update_spans_args(self, JS(args))?;
-        self.doc.update_spans(&obj, args.0)?;
+        let config = interop::import_update_spans_config(config)?;
+        self.doc.update_spans(&obj, config, args.0)?;
         Ok(())
     }
 
@@ -621,9 +632,7 @@ impl Automerge {
     ) -> Result<(), error::Insert> {
         let (obj, _) = self.import(obj)?;
         let datatype = JS(datatype).try_into()?;
-        let value = self
-            .import_scalar(&value, datatype)
-            .ok_or(error::Insert::ValueNotPrimitive)?;
+        let value = import_scalar(&value, datatype)?;
         let index = self.doc.length(&obj);
         self.doc.insert(&obj, index, value)?;
         Ok(())
@@ -661,9 +670,7 @@ impl Automerge {
     ) -> Result<(), error::Insert> {
         let (obj, _) = self.import(obj)?;
         let datatype = JS(datatype).try_into()?;
-        let value = self
-            .import_scalar(&value, datatype)
-            .ok_or(error::Insert::ValueNotPrimitive)?;
+        let value = import_scalar(&value, datatype)?;
         self.doc.insert(&obj, index as usize, value)?;
         Ok(())
     }
@@ -720,7 +727,7 @@ impl Automerge {
         &mut self,
         text: JsValue,
         index: usize,
-        heads: Option<Array>,
+        heads: JsValue,
     ) -> Result<JsValue, error::GetBlock> {
         let (text, _) = self.import(text)?;
         let Some((Value::Object(am::ObjType::Map), id)) = self.doc.get(&text, index)? else {
@@ -774,9 +781,7 @@ impl Automerge {
         let (obj, _) = self.import(obj)?;
         let prop = self.import_prop(prop)?;
         let datatype = JS(datatype).try_into()?;
-        let value = self
-            .import_scalar(&value, datatype)
-            .ok_or(error::Insert::ValueNotPrimitive)?;
+        let value = import_scalar(&value, datatype)?;
         self.doc.put(&obj, prop, value)?;
         Ok(())
     }
@@ -848,12 +853,7 @@ impl Automerge {
 
     // skip_typescript as the optional heads parameter can't be typed here
     #[wasm_bindgen(js_name = get, skip_typescript)]
-    pub fn get(
-        &self,
-        obj: JsValue,
-        prop: JsValue,
-        heads: Option<Array>,
-    ) -> Result<JsValue, error::Get> {
+    pub fn get(&self, obj: JsValue, prop: JsValue, heads: JsValue) -> Result<JsValue, error::Get> {
         let (obj, _) = self.import(obj)?;
         let prop = to_prop(prop);
         let heads = get_heads(heads)?;
@@ -882,7 +882,7 @@ impl Automerge {
         &self,
         obj: JsValue,
         prop: JsValue,
-        heads: Option<Array>,
+        heads: JsValue,
     ) -> Result<JsValue, error::Get> {
         let (obj, _) = self.import(obj)?;
         let prop = to_prop(prop);
@@ -919,7 +919,7 @@ impl Automerge {
 
     // skip_typescript as we can't type the optional heads parameter
     #[wasm_bindgen(js_name = objInfo, skip_typescript)]
-    pub fn obj_info(&self, obj: JsValue, heads: Option<Array>) -> Result<Object, error::Get> {
+    pub fn obj_info(&self, obj: JsValue, heads: JsValue) -> Result<Object, error::Get> {
         // fixme - import takes a path - needs heads to be accurate
         let (obj, _) = self.import(obj)?;
         let typ = self.doc.object_type(&obj)?;
@@ -940,12 +940,7 @@ impl Automerge {
 
     // skip_typescript as the optional heads parameter can't be typed here
     #[wasm_bindgen(js_name = getAll, skip_typescript)]
-    pub fn get_all(
-        &self,
-        obj: JsValue,
-        arg: JsValue,
-        heads: Option<Array>,
-    ) -> Result<Array, error::Get> {
+    pub fn get_all(&self, obj: JsValue, arg: JsValue, heads: JsValue) -> Result<Array, error::Get> {
         let (obj, _) = self.import(obj)?;
         let result = Array::new();
         let prop = to_prop(arg);
@@ -1095,11 +1090,15 @@ impl Automerge {
     #[wasm_bindgen(unchecked_return_type = "Patch[]")]
     pub fn diff(
         &mut self,
-        #[wasm_bindgen(unchecked_param_type = "Heads")] before: Array,
-        #[wasm_bindgen(unchecked_param_type = "Heads")] after: Array,
+        #[wasm_bindgen(unchecked_param_type = "Heads")] before: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "Heads")] after: JsValue,
     ) -> Result<Array, error::Diff> {
-        let before = get_heads(Some(before))?.unwrap();
-        let after = get_heads(Some(after))?.unwrap();
+        let before = get_heads(before)
+            .map_err(error::Diff::InvalidBeforeHeads)?
+            .ok_or_else(|| error::Diff::MissingBeforeHeads)?;
+        let after = get_heads(after)
+            .map_err(error::Diff::InvalidAfterHeads)?
+            .ok_or_else(|| error::Diff::MissingAfterHeads)?;
 
         let patches = self.doc.diff(&before, &after);
 
@@ -1108,9 +1107,12 @@ impl Automerge {
 
     pub fn isolate(
         &mut self,
-        #[wasm_bindgen(unchecked_param_type = "Heads")] heads: Array,
+        #[wasm_bindgen(unchecked_param_type = "Heads")] heads: JsValue,
     ) -> Result<(), error::Isolate> {
-        let heads = get_heads(Some(heads))?.unwrap();
+        let Some(heads) = get_heads(heads)? else {
+            return Err(error::Isolate::NoHeads);
+        };
+
         self.doc.isolate(&heads);
         Ok(())
     }
@@ -1121,7 +1123,7 @@ impl Automerge {
 
     // skip_typescript as the optional heads parameter can't be typed
     #[wasm_bindgen(skip_typescript)]
-    pub fn length(&self, obj: JsValue, heads: Option<Array>) -> Result<f64, error::Get> {
+    pub fn length(&self, obj: JsValue, heads: JsValue) -> Result<f64, error::Get> {
         let (obj, _) = self.import(obj)?;
         if let Some(heads) = get_heads(heads)? {
             Ok(self.doc.length_at(&obj, &heads) as f64)
@@ -1154,9 +1156,9 @@ impl Automerge {
     #[wasm_bindgen(js_name=saveSince)]
     pub fn save_since(
         &mut self,
-        #[wasm_bindgen(unchecked_param_type = "Heads")] heads: Array,
+        #[wasm_bindgen(unchecked_param_type = "Heads")] heads: JsValue,
     ) -> Result<Uint8Array, interop::error::BadChangeHashes> {
-        let heads = get_heads(Some(heads))?.unwrap_or(Vec::new());
+        let heads = get_heads(heads)?.unwrap_or(Vec::new());
         let bytes = self.doc.save_after(&heads);
         Ok(Uint8Array::from(bytes.as_slice()))
     }
@@ -1299,7 +1301,7 @@ impl Automerge {
 
     // skip_typescript as the optional heads parameter can't be typed
     #[wasm_bindgen(js_name = getMissingDeps, skip_typescript)]
-    pub fn get_missing_deps(&mut self, heads: Option<Array>) -> Result<Array, error::Get> {
+    pub fn get_missing_deps(&mut self, heads: JsValue) -> Result<Array, error::Get> {
         let heads = get_heads(heads)?.unwrap_or_default();
         let deps = self.doc.get_missing_deps(&heads);
         let deps: Array = deps
@@ -1347,7 +1349,7 @@ impl Automerge {
     pub fn materialize(
         &mut self,
         obj: JsValue,
-        heads: Option<Array>,
+        heads: JsValue,
         meta: JsValue,
     ) -> Result<JsValue, error::Materialize> {
         let (obj, obj_type) = self.import(obj).unwrap_or((ROOT, am::ObjType::Map));
@@ -1364,7 +1366,7 @@ impl Automerge {
         &mut self,
         obj: JsValue,
         position: JsValue,
-        heads: Option<Array>,
+        heads: JsValue,
         move_cursor: JsValue,
     ) -> Result<String, error::Cursor> {
         let (obj, obj_type) = self.import(obj).unwrap_or((ROOT, am::ObjType::Map));
@@ -1413,7 +1415,7 @@ impl Automerge {
         &mut self,
         obj: JsValue,
         cursor: JsValue,
-        heads: Option<Array>,
+        heads: JsValue,
     ) -> Result<f64, error::Cursor> {
         let (obj, obj_type) = self.import(obj).unwrap_or((ROOT, am::ObjType::Map));
         if obj_type != am::ObjType::Text {
@@ -1466,9 +1468,7 @@ impl Automerge {
         let name = name.as_string().ok_or(error::Mark::InvalidName)?;
 
         let datatype = JS(datatype).try_into()?;
-        let value = self
-            .import_scalar(&value, datatype)
-            .ok_or_else(|| error::Mark::InvalidValue)?;
+        let value = import_scalar(&value, datatype)?;
 
         self.doc
             .mark(&obj, Mark::new(name, value, start, end), expand)?;
@@ -1486,7 +1486,7 @@ impl Automerge {
 
     // skip_typescript as we can't type the optional heads paramater
     #[wasm_bindgen(skip_typescript)]
-    pub fn marks(&mut self, obj: JsValue, heads: Option<Array>) -> Result<JsValue, JsValue> {
+    pub fn marks(&mut self, obj: JsValue, heads: JsValue) -> Result<JsValue, JsValue> {
         let (obj, _) = self.import(obj)?;
         let heads = get_heads(heads)?;
         let marks = if let Some(heads) = heads {
@@ -1513,7 +1513,7 @@ impl Automerge {
         &mut self,
         obj: JsValue,
         index: f64,
-        heads: Option<Array>,
+        heads: JsValue,
     ) -> Result<Object, JsValue> {
         let (obj, _) = self.import(obj)?;
         let heads = get_heads(heads)?;
@@ -1575,6 +1575,16 @@ impl Automerge {
         js_set(&result, "rustcVersion", rustc_version).unwrap();
         result.into()
     }
+
+    #[wasm_bindgen(js_name = "saveBundle")]
+    pub fn save_bundle(&mut self, hashes: JsValue) -> Result<Uint8Array, error::SaveBundle> {
+        let hashes: Vec<automerge::ChangeHash> = JS(hashes).try_into()?;
+        let bundle = self
+            .doc
+            .bundle(hashes.into_iter())
+            .map_err(error::SaveBundle::DoBundle)?;
+        Ok(Uint8Array::from(bundle.bytes()))
+    }
 }
 
 // skip_typescript as the definition requires an optional argument so we define
@@ -1624,9 +1634,9 @@ pub fn load(data: Uint8Array, options: JsValue) -> Result<Automerge, error::Load
         am::LoadOptions::new()
             .on_partial_load(on_partial_load)
             .verification_mode(verification_mode)
-            .migrate_strings(string_migration),
-    )?
-    .with_text_rep(TextRepresentation::String(TextEncoding::Utf16CodeUnit));
+            .migrate_strings(string_migration)
+            .text_encoding(TextEncoding::Utf16CodeUnit),
+    )?;
     if let Some(s) = actor {
         let actor =
             automerge::ActorId::from(hex::decode(s).map_err(error::BadActorId::from)?.to_vec());
@@ -1723,7 +1733,38 @@ pub fn decode_sync_state(data: Uint8Array) -> Result<SyncState, sync::DecodeSync
     SyncState::decode(data)
 }
 
-struct UpdateSpansArgs(Vec<am::BlockOrText<'static>>);
+struct UpdateSpansArgs(Vec<am::iter::Span>);
+
+#[wasm_bindgen(js_name = "readBundle")]
+pub fn read_bundle(bundle: Uint8Array) -> Result<JsValue, error::ReadBundle> {
+    let bundle_bytes = bundle.to_vec();
+    let bundle = automerge::Bundle::try_from(bundle_bytes.as_slice())
+        .map_err(|e| error::ReadBundle(e.to_string()))?;
+    let changes = bundle
+        .to_changes()
+        .map_err(|e| error::ReadBundle(e.to_string()))?;
+    let js_changes = changes
+        .iter()
+        .map(|c| {
+            let legacy_change = automerge::ExpandedChange::from(c);
+            let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+            legacy_change
+                .serialize(&serializer)
+                .map_err(|e| error::ReadBundle(e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = js_sys::Object::new();
+    Reflect::set(
+        &result,
+        &("changes").into(),
+        &js_sys::Array::from_iter(js_changes.iter()).into(),
+    )
+    .unwrap();
+
+    let deps = bundle.deps().to_vec();
+    Reflect::set(&result, &("deps").into(), &JS::from(deps).0).unwrap();
+    Ok(result.into())
+}
 
 pub mod error {
     use automerge::{AutomergeError, ObjType};
@@ -1813,6 +1854,8 @@ pub mod error {
         ImportObj(#[from] interop::error::ImportObj),
         #[error(transparent)]
         Automerge(#[from] AutomergeError),
+        #[error(transparent)]
+        InvalidImport(#[from] interop::error::ImportValue),
         #[error("value at {0} in values to insert was not a primitive")]
         ValueNotPrimitive(usize),
     }
@@ -1855,6 +1898,8 @@ pub mod error {
         InvalidArgs(#[from] interop::error::InvalidUpdateSpansArgs),
         #[error("update_text is only availalbe for the string representation of text objects")]
         TextRepNotString,
+        #[error("invalid config: {0}")]
+        BadConfig(#[from] interop::error::ImportUpdateSpansConfig),
     }
 
     impl From<UpdateSpans> for JsValue {
@@ -1867,12 +1912,12 @@ pub mod error {
     pub enum Insert {
         #[error("invalid object id: {0}")]
         ImportObj(#[from] interop::error::ImportObj),
-        #[error("the value to insert was not a primitive")]
-        ValueNotPrimitive,
         #[error(transparent)]
         Automerge(#[from] AutomergeError),
         #[error(transparent)]
         InvalidProp(#[from] interop::error::InvalidProp),
+        #[error(transparent)]
+        InvalidImport(#[from] interop::error::ImportValue),
         #[error(transparent)]
         InvalidValue(#[from] interop::error::InvalidValue),
         #[error(transparent)]
@@ -1987,10 +2032,16 @@ pub mod error {
     pub enum Diff {
         #[error(transparent)]
         Export(#[from] interop::error::Export),
-        #[error("bad heads: {0}")]
-        Heads(#[from] interop::error::BadChangeHashes),
         #[error(transparent)]
         Automerge(#[from] AutomergeError),
+        #[error("invalid before heads: {0}")]
+        InvalidBeforeHeads(interop::error::BadChangeHashes),
+        #[error("before heads were null or undefined")]
+        MissingBeforeHeads,
+        #[error("invalid after heads: {0}")]
+        InvalidAfterHeads(interop::error::BadChangeHashes),
+        #[error("after heads were null or undefined")]
+        MissingAfterHeads,
     }
 
     impl From<Diff> for JsValue {
@@ -2003,6 +2054,8 @@ pub mod error {
     pub enum Isolate {
         #[error("bad heads: {0}")]
         Heads(#[from] interop::error::BadChangeHashes),
+        #[error("no heads specified")]
+        NoHeads,
     }
 
     impl From<Isolate> for JsValue {
@@ -2111,8 +2164,8 @@ pub mod error {
         Expand(#[from] interop::error::BadExpand),
         #[error("Invalid mark name")]
         InvalidName,
-        #[error("Invalid mark value")]
-        InvalidValue,
+        #[error("Invalid mark value: {0}")]
+        ImportValue(#[from] interop::error::ImportValue),
         #[error("start must be a number")]
         InvalidStart,
         #[error("end must be a number")]
@@ -2218,6 +2271,30 @@ pub mod error {
     impl From<GetDecodedChangeByHash> for JsValue {
         fn from(e: GetDecodedChangeByHash) -> Self {
             RangeError::new(&e.to_string()).into()
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum SaveBundle {
+        #[error(transparent)]
+        BadChangeHashes(#[from] interop::error::BadChangeHashes),
+        #[error("error creating bundle: {0}")]
+        DoBundle(automerge::AutomergeError),
+    }
+
+    impl From<SaveBundle> for JsValue {
+        fn from(e: SaveBundle) -> Self {
+            RangeError::new(&e.to_string()).into()
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("error parsing bundle: {}", 0)]
+    pub struct ReadBundle(pub(super) String);
+
+    impl From<ReadBundle> for JsValue {
+        fn from(e: ReadBundle) -> Self {
+            RangeError::new(&e.0).into()
         }
     }
 }

@@ -3,8 +3,7 @@ use std::str::FromStr;
 use automerge::{
     hydrate_list, hydrate_map,
     iter::Span,
-    marks::{ExpandMark, Mark},
-    patches::TextRepresentation,
+    marks::{ExpandMark, Mark, UpdateSpansConfig},
     transaction::Transactable,
     ActorId, AutoCommit, ConcreteTextValue, ObjType, Patch, PatchAction, Prop, ReadDoc,
     ScalarValue, TextEncoding, Value, ROOT,
@@ -214,10 +213,7 @@ fn local_patches_created_for_marks() {
             path: vec![(automerge::ROOT, "text".into())],
             action: PatchAction::SpliceText {
                 index: 0,
-                value: ConcreteTextValue::new(
-                    "the ",
-                    TextRepresentation::String(TextEncoding::default()),
-                ),
+                value: ConcreteTextValue::new("the ", TextEncoding::platform_default()),
                 marks: Some(
                     vec![("bold".to_string(), ScalarValue::from(true))]
                         .into_iter()
@@ -230,10 +226,7 @@ fn local_patches_created_for_marks() {
             path: vec![(automerge::ROOT, "text".into())],
             action: PatchAction::SpliceText {
                 index: 4,
-                value: ConcreteTextValue::new(
-                    "quick ",
-                    TextRepresentation::String(TextEncoding::default()),
-                ),
+                value: ConcreteTextValue::new("quick ", TextEncoding::platform_default()),
                 marks: Some(
                     vec![
                         ("bold".to_string(), ScalarValue::from(true)),
@@ -249,10 +242,7 @@ fn local_patches_created_for_marks() {
             path: vec![(automerge::ROOT, "text".into())],
             action: PatchAction::SpliceText {
                 index: 10,
-                value: ConcreteTextValue::new(
-                    "fox",
-                    TextRepresentation::String(TextEncoding::default()),
-                ),
+                value: ConcreteTextValue::new("fox", TextEncoding::platform_default()),
                 marks: Some(
                     vec![
                         ("bold".to_string(), ScalarValue::from(true)),
@@ -272,10 +262,7 @@ fn local_patches_created_for_marks() {
             path: vec![(automerge::ROOT, "text".into())],
             action: PatchAction::SpliceText {
                 index: 13,
-                value: ConcreteTextValue::new(
-                    " jumps",
-                    TextRepresentation::String(TextEncoding::default()),
-                ),
+                value: ConcreteTextValue::new(" jumps", TextEncoding::platform_default()),
                 marks: Some(
                     vec![
                         ("bold".to_string(), ScalarValue::from(true)),
@@ -293,7 +280,7 @@ fn local_patches_created_for_marks() {
                 index: 19,
                 value: ConcreteTextValue::new(
                     " over the lazy dog",
-                    TextRepresentation::String(TextEncoding::default()),
+                    TextEncoding::platform_default(),
                 ),
                 marks: Some(
                     vec![("bold".to_string(), ScalarValue::from(true))]
@@ -352,7 +339,10 @@ fn empty_marks_before_block_marker_dont_repeat_text() {
         vec![
             Span::Block(hydrate_map! {}),
             Span::Block(hydrate_map! {}),
-            Span::Text("a".to_string(), None),
+            Span::Text {
+                text: "a".to_string(),
+                marks: None
+            },
         ]
     );
 }
@@ -393,19 +383,15 @@ fn insertions_after_noexpand_spans_are_not_marked() {
     .unwrap();
 
     let spans = doc.spans(&text).unwrap();
-    let mut new_blocks = spans
-        .map(|s| match s {
-            Span::Text(s, _) => automerge::BlockOrText::Text(s.into()),
-            Span::Block(m) => automerge::BlockOrText::Block(m),
-        })
-        .collect::<Vec<_>>();
-    new_blocks.push(automerge::BlockOrText::Block(hydrate_map! {
+    let mut new_blocks = spans.collect::<Vec<_>>();
+    new_blocks.push(Span::Block(hydrate_map! {
         "type" => "paragraph",
         "parents" => hydrate_list![],
         "attrs" => hydrate_map!{},
     }));
 
-    doc.update_spans(&text, new_blocks).unwrap();
+    doc.update_spans(&text, UpdateSpansConfig::default(), new_blocks)
+        .unwrap();
 
     let heads_before = doc.get_heads();
     doc.splice_text(&text, 11, 0, "a").unwrap();
@@ -677,19 +663,19 @@ proptest::proptest! {
         let mut expected_chars = String::new();
         for action in &scenario {
             match action {
-                Action::Insert(index, value) => {
+                Action::Insert{ index, value } => {
                     doc.splice_text(&text, *index, 0, value).unwrap();
                     expected_chars.insert_str(*index, value);
                 }
-                Action::Delete(index, len) => {
+                Action::Delete{ index, len } => {
                     doc.splice_text(&text, *index, *len as isize, "").unwrap();
                     expected_chars.drain(*index..(*index + *len));
                 }
-                Action::SplitBlock(index) => {
+                Action::SplitBlock{ index } => {
                     doc.split_block(&text, *index).unwrap();
                     expected_chars.insert(*index, '\n');
                 }
-                Action::AddMark(index, len, name, value) => {
+                Action::AddMark{ index, len, name, value } => {
                     doc.mark(&text, Mark::new(name.clone(), value.clone(), *index, index + len), automerge::marks::ExpandMark::Both).unwrap();
                 }
             }
@@ -702,7 +688,7 @@ proptest::proptest! {
         }
 
         let span_chars = spans.iter().map(|span| match span {
-            Span::Text(text, _) => text.clone(),
+            Span::Text{ text, marks: _ } => text.clone(),
             Span::Block(_) => "\n".to_string(),
         }).collect::<String>();
         if !span_chars.chars().eq(expected_chars.chars()) {
@@ -727,7 +713,7 @@ fn marks_are_consolidated(spans: &Vec<Span>) -> bool {
     let mut last_marks = None;
     for span in spans {
         match span {
-            Span::Text(_, marks) => {
+            Span::Text { text: _, marks } => {
                 if Some(marks) == last_marks {
                     return false;
                 }
@@ -743,38 +729,57 @@ fn marks_are_consolidated(spans: &Vec<Span>) -> bool {
 
 #[derive(Debug, Clone)]
 enum Action {
-    Insert(usize, String),
-    Delete(usize, usize),
-    SplitBlock(usize),
-    AddMark(usize, usize, String, ScalarValue),
+    Insert {
+        index: usize,
+        value: String,
+    },
+    Delete {
+        index: usize,
+        len: usize,
+    },
+    SplitBlock {
+        index: usize,
+    },
+    AddMark {
+        index: usize,
+        len: usize,
+        name: String,
+        value: ScalarValue,
+    },
 }
 
 fn arb_insert(text: &str) -> impl proptest::strategy::Strategy<Value = Action> {
-    (0..=text.len(), "[a-zA-Z]{1,10}").prop_map(|(index, value)| Action::Insert(index, value))
+    (0..=text.len(), "[a-zA-Z]{1,10}").prop_map(|(index, value)| Action::Insert { index, value })
 }
 
 fn arb_delete(text: &str) -> impl proptest::strategy::Strategy<Value = Action> {
     let len = text.len();
     if len == 1 {
-        return proptest::strategy::Just(Action::Delete(0, 1)).boxed();
+        return proptest::strategy::Just(Action::Delete { index: 0, len: 1 }).boxed();
     }
     (1..len)
         .prop_flat_map(move |delete_len| {
-            (0..(len - delete_len)).prop_map(move |index| Action::Delete(index, delete_len))
+            (0..(len - delete_len)).prop_map(move |index| Action::Delete {
+                index,
+                len: delete_len,
+            })
         })
         .boxed()
 }
 
 fn arb_split_block(text: &str) -> impl proptest::strategy::Strategy<Value = Action> {
-    (0..=text.len()).prop_map(Action::SplitBlock)
+    (0..=text.len()).prop_map(|i| Action::SplitBlock { index: i })
 }
 
 fn arb_add_mark(text: &str) -> impl proptest::strategy::Strategy<Value = Action> {
     let text_len = text.len();
     (0..text_len).prop_flat_map(move |index| {
         (0..(text_len - index)).prop_flat_map(move |len| {
-            ("[a-zA-Z]{1,10}", "[a-zA-Z]{1,10}").prop_map(move |(name, value)| {
-                Action::AddMark(index, len, name, ScalarValue::from(value))
+            ("[a-zA-Z]{1,10}", "[a-zA-Z]{1,10}").prop_map(move |(name, value)| Action::AddMark {
+                index,
+                len,
+                name,
+                value: ScalarValue::from(value),
             })
         })
     })
@@ -808,16 +813,16 @@ fn arb_scenario() -> impl proptest::strategy::Strategy<Value = Vec<Action>> {
                 let mut actions_so_far = actions_so_far.clone();
                 actions_so_far.push(action.clone());
                 match action {
-                    Action::Insert(index, value) => {
+                    Action::Insert { index, value } => {
                         state.insert_str(index, &value);
                     }
-                    Action::Delete(index, len) => {
+                    Action::Delete { index, len } => {
                         state.drain(index..index + len);
                     }
-                    Action::SplitBlock(index) => {
+                    Action::SplitBlock { index } => {
                         state.insert(index, '\n');
                     }
-                    Action::AddMark(..) => {}
+                    Action::AddMark { .. } => {}
                 }
                 pump(state, actions_so_far, max_actions)
             })
@@ -974,10 +979,7 @@ fn incorrect_patches_produced_when_isolating_and_integrating() {
                 path: vec![(ROOT, Prop::Map("name".to_string()))],
                 action: PatchAction::SpliceText {
                     index: 0,
-                    value: ConcreteTextValue::new(
-                        &new_name,
-                        TextRepresentation::String(TextEncoding::UnicodeCodePoint)
-                    ),
+                    value: ConcreteTextValue::new(&new_name, TextEncoding::UnicodeCodePoint),
                     marks: None
                 }
             },
@@ -986,13 +988,111 @@ fn incorrect_patches_produced_when_isolating_and_integrating() {
                 path: vec![(ROOT, Prop::Map("color".to_string()))],
                 action: PatchAction::SpliceText {
                     index: 0,
-                    value: ConcreteTextValue::new(
-                        "unset",
-                        TextRepresentation::String(TextEncoding::UnicodeCodePoint)
-                    ),
+                    value: ConcreteTextValue::new("unset", TextEncoding::UnicodeCodePoint),
                     marks: None
                 }
             }
         ]
     );
+}
+
+#[test]
+fn deleting_in_middle_of_multibyte_char_moves_the_cursor_to_after_the_character() {
+    let mut doc = AutoCommit::new_with_encoding(TextEncoding::Utf16CodeUnit);
+    let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+    doc.splice_text(&text, 0, 0, "🐻🐻🐻🐻🐻🐻").unwrap();
+
+    assert_eq!(doc.text(&text).unwrap(), "🐻🐻🐻🐻🐻🐻");
+
+    doc.splice_text(&text, 2, 2, "A🐻A").unwrap();
+    assert_eq!(doc.text(&text).unwrap(), "🐻A🐻A🐻🐻🐻🐻");
+
+    // Deleting in the middle of the multibyte character 🐻 at index 4
+    // (according to utf16 offsets) should delete the following character
+    doc.splice_text(&text, 4, 1, "X").unwrap();
+    assert_eq!(doc.text(&text).unwrap(), "🐻A🐻X🐻🐻🐻🐻");
+
+    doc.splice_text(&text, 4, 2, "Y").unwrap();
+    assert_eq!(doc.text(&text).unwrap(), "🐻A🐻Y🐻🐻🐻");
+}
+
+#[test]
+fn splicing_into_multibyte_characters() {
+    // This test checks that splicing into multibyte characters works correctly. Multibyte
+    // characters are _usually_ utf16 surrogate pairs, but there are other possibilities
+    // because technically the payload of an insertion operation can be any valid utf-8
+    // string. In this test we use the deprecated `legacy` API to create an operation
+    // which has the string 'BBBBB' as it's payload and use this string to test the
+    // behavior of splicing into and around multibyte characters.
+
+    let mut doc = AutoCommit::new_with_encoding(TextEncoding::Utf16CodeUnit);
+    let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+    let actor = doc.get_actor().clone();
+    doc.splice_text(&text, 0, 0, "A").unwrap();
+    let parent_hash = doc.commit().unwrap();
+
+    // We have to construct this change using the legacy API because we intentionally make it
+    // impossible to create these kind of changes. The notable thing here is that there is
+    // an op which is a single insertion but contains multiple grapheme clusters (the 'BBBBB')
+    let weird_actor = ActorId::random();
+    let weird_change = automerge::ExpandedChange {
+        operations: vec![
+            automerge::legacy::Op {
+                action: automerge::legacy::OpType::Put("BBBBB".into()),
+                obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor.clone())),
+                key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Id(
+                    automerge::legacy::OpId(2, actor.clone()),
+                )),
+                pred: automerge::legacy::SortedVec::new(),
+                insert: true,
+            },
+            automerge::legacy::Op {
+                action: automerge::legacy::OpType::Make(ObjType::Map),
+                obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor.clone())),
+                key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Id(
+                    automerge::legacy::OpId(3, weird_actor.clone()),
+                )),
+                pred: automerge::legacy::SortedVec::new(),
+                insert: true,
+            },
+            automerge::legacy::Op {
+                action: automerge::legacy::OpType::Put("C".into()),
+                obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor.clone())),
+                key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Id(
+                    automerge::legacy::OpId(4, weird_actor.clone()),
+                )),
+                pred: automerge::legacy::SortedVec::new(),
+                insert: true,
+            },
+        ],
+        actor_id: weird_actor,
+        hash: None,
+        seq: 1,
+        start_op: std::num::NonZero::new(3).unwrap(),
+        time: 0,
+        message: None,
+        deps: vec![parent_hash],
+        extra_bytes: Vec::new(),
+    };
+    doc.apply_changes(vec![weird_change.into()]).unwrap();
+
+    assert_eq!(doc.text(&text).unwrap(), "ABBBBB\u{fffc}C");
+
+    let mut doc1 = doc.clone();
+    doc1.splice_text(&text, 3, 4, "X").unwrap();
+
+    // deleting in the middle of a multi-byte character will delete after
+    assert_eq!(doc1.text(&text).unwrap(), "ABBBBBX");
+
+    let mut doc2 = doc.clone();
+    doc2.splice_text(&text, 3, 0, "X").unwrap();
+
+    // inserting in the middle of a mutli-bytes span inserts after
+    assert_eq!(doc2.text(&text).unwrap(), "ABBBBBX\u{fffc}C");
+
+    let mut doc3 = doc.clone();
+    doc3.splice_text(&text, 3, 1, "").unwrap();
+
+    // deleting in the middle of a multi-byte character will delete after
+    assert_eq!(doc3.text(&text).unwrap(), "ABBBBBC");
 }

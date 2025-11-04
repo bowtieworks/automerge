@@ -839,17 +839,6 @@ describe("Automerge", () => {
       assert.strictEqual(Automerge.isImmutableString(d.bar), false)
     })
   })
-  it("rust preview number should match js preview number", async () => {
-    // this test can be removed after the alpha/preview peroid
-    const pkg = JSON.parse(await readFile("./package.json", "utf8"))
-    let doc = Automerge.init()
-    let stats = Automerge.stats(doc)
-    assert.strictEqual(stats.cargoPackageName, "automerge")
-    assert.strictEqual(
-      stats.cargoPackageVersion.split(".").pop(),
-      pkg.version.split(".").pop(),
-    )
-  })
   it("it should be able to roll back a transaction", () => {
     let doc1 = Automerge.from<any>({ foo: "bar" })
     let save1 = Automerge.save(doc1)
@@ -861,5 +850,34 @@ describe("Automerge", () => {
     })
     let save2 = Automerge.save(doc1)
     assert.deepEqual(save1, save2)
+  })
+
+  it("it should be able to handle ints and floats at their limits", () => {
+    let imax = BigInt("9223372036854775807")
+    let imin = BigInt("-9223372036854775808")
+    let umax = BigInt("18446744073709551615")
+    let inf = Infinity
+    let ninf = -Infinity
+    let nan = NaN;
+    let base = { nan, inf, ninf, imax, imin, umax }
+    let doc1 = Automerge.from<any>(base)
+    assert.deepEqual(doc1, base)
+    let doc2 = Automerge.load<any>(Automerge.save(doc1));
+    assert.deepEqual(doc2, base)
+    let doc3 = Automerge.change(Automerge.init<any>(), d => {
+        d.imax = imax;
+        d.umax = umax;
+        d.imin = imin;
+        d.nan = nan;
+        d.inf = inf;
+        d.ninf = ninf;
+    })
+    assert.deepEqual(doc3, base)
+    assert.throws(() => {
+      let doc4 = Automerge.from<any>({ bad: umax + BigInt("1") })
+    }, /larger than/)
+    assert.throws(() => {
+      let doc4 = Automerge.from<any>({ bad: imin - BigInt("1") })
+    }, /smaller than/)
   })
 })

@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -46,9 +46,6 @@ impl Mark {
 
     pub(crate) fn into_mark_set(self) -> Arc<MarkSet> {
         let mut m = MarkSet::default();
-        //let data = self.data.into_owned();
-        //let name = self.name;
-        //m.insert(data.name, data.value);
         m.insert(self.name, self.value);
         Arc::new(m)
     }
@@ -109,11 +106,35 @@ pub struct MarkSet {
     marks: BTreeMap<SmolStr, ScalarValue>,
 }
 
-impl MarkSet {
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &ScalarValue)> {
-        self.marks
-            .iter()
+use std::collections::btree_map;
+
+#[derive(Debug, Clone, Default)]
+pub struct MarkSetIter<'a> {
+    set: Option<btree_map::Iter<'a, SmolStr, ScalarValue>>,
+}
+
+impl<'a> MarkSetIter<'a> {
+    fn new(set: &'a MarkSet) -> Self {
+        Self {
+            set: Some(set.marks.iter()),
+        }
+    }
+}
+
+impl<'a> Iterator for MarkSetIter<'a> {
+    type Item = (&'a str, &'a ScalarValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.set
+            .as_mut()?
+            .next()
             .map(|(name, value)| (name.as_str(), value))
+    }
+}
+
+impl MarkSet {
+    pub fn iter(&self) -> MarkSetIter<'_> {
+        MarkSetIter::new(self)
     }
 
     pub fn num_marks(&self) -> usize {
@@ -140,27 +161,6 @@ impl MarkSet {
         self.inner().is_empty()
     }
 
-    pub(crate) fn diff(&self, other: &Self) -> Self {
-        let mut diff = BTreeMap::default();
-        for (name, value) in self.marks.iter() {
-            match other.marks.get(name) {
-                Some(v) if v != value => {
-                    diff.insert(name.clone(), v.clone());
-                }
-                None => {
-                    diff.insert(name.clone(), ScalarValue::Null);
-                }
-                _ => {}
-            }
-        }
-        for (name, value) in other.marks.iter() {
-            if !self.marks.contains_key(name) {
-                diff.insert(name.clone(), value.clone());
-            }
-        }
-        MarkSet { marks: diff }
-    }
-
     pub(crate) fn from_query_state(q: &RichTextQueryState<'_>) -> Option<Arc<Self>> {
         let mut marks = MarkStateMachine::default();
         for (id, mark_data) in q.iter() {
@@ -172,13 +172,36 @@ impl MarkSet {
     /// Return this MarkSet without any marks which have a value of Null, i.e.
     /// marks which have been removed.
     pub(crate) fn without_unmarks(self) -> Self {
+        // FIXME - do I need this clone?
         let mut marks = self.marks.clone();
         marks.retain(|_, value| !matches!(value, ScalarValue::Null));
         MarkSet { marks }
     }
+
+    // Returns a wrapper for comparing two MarkSets while ignoring marks that have been deleted.
+    //
+    // Marksets track which marks have been deleted by storing them with a value of `ScalarValue::Null`.
+    // When we want to compare the marks in two MarkSets, we often want to ignore these deleted marks so
+    // that we can focus on whether the user visible state has changed.
+    //
+    // ## Example
+    //
+    // ```rust
+    // let markset1 = MarkSet::from_iter(vec![
+    //     ("bold".to_string(), ScalarValue::String("true".to_string())),
+    //     ("italic".to_string(), ScalarValue::Null),
+    // ]);
+    // let markset2 = MarkSet::from_iter(vec![
+    //     ("bold".to_string(), ScalarValue::String("true".to_string())),
+    //     ("underlined".to_string(), ScalarValue::Null),
+    // ]);
+    // assert_eq!(markset1.non_deleted_marks(), markset2.non_deleted_marks());
+    // ```
+    pub fn non_deleted_marks(&self) -> NonDeletedMarks<'_> {
+        NonDeletedMarks(self)
+    }
 }
 
-// FromIterator implementation for an iterator of (String, ScalarValue) tuples
 impl std::iter::FromIterator<(String, ScalarValue)> for MarkSet {
     fn from_iter<I: IntoIterator<Item = (String, ScalarValue)>>(iter: I) -> Self {
         let mut marks = BTreeMap::new();
@@ -398,14 +421,58 @@ impl<'a> RichTextQueryState<'a> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&OpId, &MarkData<'a>)> {
         self.map.iter()
     }
+}
 
-    /*
-        pub(crate) fn insert(&mut self, op: OpId, data: MarkData<'a>) {
-            self.map.insert(op, data);
-        }
+// Useful for comparing MarkSets while ignoring marks that have been deleted (i.e. have a value of Null).
+//
+// Returned by [`MarkSet::non_deleted_marks()`]
+#[derive(Debug)]
+pub struct NonDeletedMarks<'a>(&'a MarkSet);
 
-        pub(crate) fn remove(&mut self, op: &OpId) {
-            self.map.remove(op);
-        }
-    */
+impl PartialEq for NonDeletedMarks<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let us_in_them = self.0.marks.iter().all(|(name, value)| {
+            matches!(value, ScalarValue::Null) || other.0.marks.get(name) == Some(value)
+        });
+        let them_in_us = other.0.marks.iter().all(|(name, value)| {
+            matches!(value, ScalarValue::Null) || self.0.marks.get(name) == Some(value)
+        });
+        us_in_them && them_in_us
+    }
+}
+
+impl NonDeletedMarks<'_> {
+    pub fn len(&self) -> usize {
+        self.0
+            .marks
+            .iter()
+            .filter(|(_, v)| !matches!(v, ScalarValue::Null))
+            .count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Configure the expand flag used when creating marks in [`update_spans`](crate::transaction::Transactable::update_spans)
+#[derive(Default, Debug, Clone)]
+pub struct UpdateSpansConfig {
+    /// The expand flag to use when the mark does not have a flag set in Self::per_mark_expands.
+    pub default_expand: ExpandMark,
+    /// A map of mark names to the expand flag to use for that mark
+    pub per_mark_expands: HashMap<String, ExpandMark>,
+}
+
+impl UpdateSpansConfig {
+    pub fn with_default_expand(mut self, expand: ExpandMark) -> Self {
+        self.default_expand = expand;
+        self
+    }
+
+    pub fn with_mark_expand<S: AsRef<str>>(mut self, mark_name: S, expand: ExpandMark) -> Self {
+        self.per_mark_expands
+            .insert(mark_name.as_ref().to_string(), expand);
+        self
+    }
 }

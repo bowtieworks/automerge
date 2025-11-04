@@ -6,8 +6,9 @@ use std::ops::Add;
 
 use hexane::{ColumnCursor, ColumnData, DeltaCursor, StrCursor, UIntCursor};
 
+use crate::storage::BundleMetadata;
 use crate::{
-    clock::{Clock, ClockData},
+    clock::{Clock, SeqClock},
     columnar::column_range::{DepsRange, ValueRange},
     error::AutomergeError,
     op_set2::{change::BuildChangeMetadata, ActorCursor, ActorIdx, MetaCursor, ValueMeta},
@@ -37,7 +38,7 @@ pub(crate) struct ChangeGraph {
     extra_bytes_raw: Vec<u8>,
     heads: BTreeSet<ChangeHash>,
     nodes_by_hash: HashMap<ChangeHash, NodeIdx>,
-    clock_cache: HashMap<NodeIdx, Clock>,
+    clock_cache: HashMap<NodeIdx, SeqClock>,
     seq_index: Vec<Vec<NodeIdx>>,
 }
 
@@ -268,7 +269,7 @@ impl ChangeGraph {
                 let start = max_op as u64 - num_ops + 1;
                 if counter < start {
                     Ordering::Greater
-                } else if max_op as u64 <= counter {
+                } else if (max_op as u64) < counter {
                     Ordering::Less
                 } else {
                     Ordering::Equal
@@ -293,6 +294,55 @@ impl ChangeGraph {
 
     pub(crate) fn has_change(&self, hash: &ChangeHash) -> bool {
         self.nodes_by_hash.contains_key(hash)
+    }
+
+    pub(crate) fn get_bundle_metadata<I>(
+        &self,
+        hashes: I,
+    ) -> impl Iterator<Item = Result<BundleMetadata<'_>, MissingDep>>
+    where
+        I: IntoIterator<Item = ChangeHash>,
+    {
+        hashes.into_iter().map(|hash| {
+            let index = self
+                .nodes_by_hash
+                .get(&hash)
+                .cloned()
+                .ok_or(MissingDep(hash))?;
+            let i = index.0 as usize;
+            let actor = self.actors[i].into();
+            let timestamp = *self.timestamps.get(i).flatten().unwrap_or_default();
+            let max_op = self.max_ops[i] as u64;
+            let num_ops = *self.num_ops.get(i).flatten().unwrap_or_default();
+            let message = self.messages.get(i).flatten();
+
+            // FIXME - this needs a test
+            let meta = self.extra_bytes_meta.get_with_acc(i).unwrap();
+            let meta_range =
+                meta.acc.as_usize()..(meta.acc.as_usize() + meta.item.unwrap().length());
+            let extra = Cow::Borrowed(&self.extra_bytes_raw[meta_range]);
+
+            let deps = self
+                .parents(index)
+                .map(|p| self.hashes[p.0 as usize])
+                .collect::<Vec<_>>();
+
+            //num_deps += deps.len();
+            let start_op = max_op - num_ops + 1;
+            let seq = self.seq[i] as u64;
+            Ok(BundleMetadata {
+                hash,
+                actor,
+                seq,
+                start_op,
+                max_op,
+                timestamp,
+                message,
+                extra,
+                deps,
+                builder: i,
+            })
+        })
     }
 
     pub(crate) fn get_build_metadata<I>(
@@ -356,14 +406,14 @@ impl ChangeGraph {
         (changes, num_deps)
     }
 
-    fn get_build_indexes(&self, clock: Clock) -> Vec<NodeIdx> {
+    fn get_build_indexes(&self, clock: SeqClock) -> Vec<NodeIdx> {
         let mut change_indexes: Vec<NodeIdx> = Vec::new();
         // walk the state from the given deps clock and add them into the vec
         for (actor_index, actor_changes) in self.seq_index.iter().enumerate() {
-            if let Some(clock_data) = clock.get_for_actor(&actor_index) {
+            if let Some(seq) = clock.get_for_actor(&actor_index) {
                 // find the change in this actors sequence of changes that corresponds to the max_op
                 // recorded for them in the clock
-                change_indexes.extend(&actor_changes[clock_data.seq as usize..]);
+                change_indexes.extend(&actor_changes[seq.get() as usize..]);
             } else {
                 change_indexes.extend(&actor_changes[..]);
             }
@@ -377,7 +427,7 @@ impl ChangeGraph {
 
     #[inline(never)]
     pub(crate) fn get_hashes(&self, have_deps: &[ChangeHash]) -> Vec<ChangeHash> {
-        let clock = self.clock_for_heads(have_deps);
+        let clock = self.seq_clock_for_heads(have_deps);
         self.get_build_indexes(clock)
             .into_iter()
             .filter_map(|node| self.hashes.get(node.0 as usize))
@@ -389,7 +439,7 @@ impl ChangeGraph {
         &self,
         have_deps: &[ChangeHash],
     ) -> (Vec<BuildChangeMetadata<'_>>, usize) {
-        let clock = self.clock_for_heads(have_deps);
+        let clock = self.seq_clock_for_heads(have_deps);
         let change_indexes = self.get_build_indexes(clock);
         self.get_build_metadata_for_indexes(change_indexes)
     }
@@ -457,8 +507,7 @@ impl ChangeGraph {
             .extend(iter.clone().map(|(c, _)| c.message().cloned()));
         self.extra_bytes_meta
             .extend(iter.clone().map(|(c, _)| ValueMeta::from(c.extra_bytes())));
-        self.parents
-            .extend(std::iter::repeat(None).take(iter.len()));
+        self.parents.extend(std::iter::repeat_n(None, iter.len()));
         for (c, _) in iter {
             self.extra_bytes_raw.extend_from_slice(c.extra_bytes());
         }
@@ -511,15 +560,15 @@ impl ChangeGraph {
         self.add_changes([(change, actor)].into_iter())
     }
 
-    fn cache_clock(&mut self, node_idx: NodeIdx) -> Clock {
-        let mut clock = Clock::new(self.num_actors());
+    fn cache_clock(&mut self, node_idx: NodeIdx) -> SeqClock {
+        let mut clock = SeqClock::new(self.num_actors());
         let mut to_visit = BTreeSet::from([node_idx]);
 
         self.calculate_clock_inner(&mut clock, &mut to_visit, CACHE_STEP as usize * 2);
 
         for n in to_visit {
             let sub = self.cache_clock(n);
-            Clock::merge(&mut clock, &sub);
+            SeqClock::merge(&mut clock, &sub);
         }
 
         self.clock_cache.insert(node_idx, clock.clone());
@@ -577,17 +626,28 @@ impl ChangeGraph {
     pub(crate) fn clock_for_heads(&self, heads: &[ChangeHash]) -> Clock {
         let nodes = self.heads_to_nodes(heads);
         self.calculate_clock(nodes)
+            .iter()
+            .map(|(actor, seq)| {
+                self.seq_index
+                    .get(actor)
+                    .and_then(|v| v.get(seq?.get() as usize - 1))
+                    .and_then(|i| self.max_ops.get(i.0 as usize))
+                    .copied()
+            })
+            .collect()
     }
 
-    fn clock_data_for(&self, idx: NodeIdx) -> ClockData {
-        ClockData {
-            max_op: self.max_ops[idx.0 as usize],
-            seq: self.seq[idx.0 as usize],
-        }
+    pub(crate) fn seq_clock_for_heads(&self, heads: &[ChangeHash]) -> SeqClock {
+        let nodes = self.heads_to_nodes(heads);
+        self.calculate_clock(nodes)
     }
 
-    fn calculate_clock(&self, nodes: Vec<NodeIdx>) -> Clock {
-        let mut clock = Clock::new(self.num_actors());
+    fn clock_data_for(&self, idx: NodeIdx) -> Option<u32> {
+        Some(*self.seq.get(idx.0 as usize)?)
+    }
+
+    fn calculate_clock(&self, nodes: Vec<NodeIdx>) -> SeqClock {
+        let mut clock = SeqClock::new(self.num_actors());
         let mut to_visit = nodes.into_iter().collect::<BTreeSet<_>>();
 
         self.calculate_clock_inner(&mut clock, &mut to_visit, usize::MAX);
@@ -599,7 +659,7 @@ impl ChangeGraph {
 
     fn calculate_clock_inner(
         &self,
-        clock: &mut Clock,
+        clock: &mut SeqClock,
         to_visit: &mut BTreeSet<NodeIdx>,
         limit: usize,
     ) {
@@ -615,11 +675,12 @@ impl ChangeGraph {
             clock.include(actor.into(), data);
 
             if let Some(cached) = self.clock_cache.get(&idx) {
-                Clock::merge(clock, cached);
-            } else if visited.len() <= limit {
-                to_visit.extend(self.parents(idx).filter(|p| !visited.contains(p)));
+                SeqClock::merge(clock, cached);
             } else {
-                break;
+                to_visit.extend(self.parents(idx).filter(|p| !visited.contains(p)));
+                if visited.len() > limit {
+                    break;
+                }
             }
         }
     }
@@ -685,10 +746,9 @@ mod tests {
     };
 
     use crate::{
-        clock::ClockData,
-        op_set2::{change::build_change, OpSet, TxOp},
+        op_set2::{change::build_change, op_set::ResolvedAction, OpSet, TxOp},
         types::{ObjMeta, OpId, OpType},
-        ActorId,
+        ActorId, TextEncoding,
     };
 
     use super::*;
@@ -706,12 +766,12 @@ mod tests {
         let graph = builder.build();
 
         // todo - why 4?
-        let mut expected_clock = Clock::new(3);
-        expected_clock.include(builder.index(&actor1), ClockData { max_op: 50, seq: 2 });
-        expected_clock.include(builder.index(&actor2), ClockData { max_op: 30, seq: 1 });
-        expected_clock.include(builder.index(&actor3), ClockData { max_op: 40, seq: 1 });
+        let mut expected_clock = SeqClock::new(3);
+        expected_clock.include(builder.index(&actor1), Some(2));
+        expected_clock.include(builder.index(&actor2), Some(1));
+        expected_clock.include(builder.index(&actor3), Some(1));
 
-        let clock = graph.clock_for_heads(&[change4]);
+        let clock = graph.seq_clock_for_heads(&[change4]);
         assert_eq!(clock, expected_clock);
     }
 
@@ -776,7 +836,7 @@ mod tests {
             num_new_ops: usize,
             parents: &[ChangeHash],
         ) -> ChangeHash {
-            let osd = OpSet::from_actors(self.actors.clone());
+            let osd = OpSet::from_actors(self.actors.clone(), TextEncoding::platform_default());
 
             let start_op = parents
                 .iter()
@@ -798,7 +858,7 @@ mod tests {
                         OpId::new(start_op + opnum as u64, actor_idx),
                         ObjMeta::root(),
                         0,
-                        OpType::Put("value".into()),
+                        ResolvedAction::VisibleUpdate(OpType::Put("value".into())),
                         "key".to_string(),
                         vec![],
                     )

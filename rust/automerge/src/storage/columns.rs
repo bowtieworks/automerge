@@ -49,7 +49,7 @@ pub(crate) mod compression {
     pub(crate) struct Uncompressed;
 
     /// A witness for what we know about whether or not a column is compressed
-    pub(crate) trait ColumnCompression {}
+    pub(crate) trait ColumnCompression: std::fmt::Debug {}
     impl ColumnCompression for Unknown {}
     impl ColumnCompression for Uncompressed {}
 }
@@ -261,7 +261,7 @@ impl ColumnLayoutParser {
                         GroupParseState::Ready(b) => self.columns.push(b.finish()),
                         GroupParseState::InValue(b) => self.columns.push(b.finish_empty().finish()),
                     };
-                    std::mem::swap(&mut self.state, &mut LayoutParserState::Ready);
+                    self.state = LayoutParserState::Ready;
                     self.add_column(column, range)
                 } else {
                     match group_state {

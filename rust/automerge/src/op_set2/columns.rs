@@ -10,7 +10,7 @@ use crate::storage::columns::compression::Uncompressed;
 use crate::storage::columns::ColumnId;
 use crate::storage::ColumnSpec;
 use crate::storage::{RawColumn, RawColumns};
-use crate::types::{ActorId, TextEncoding};
+use crate::types::{ActorId, SequenceType, TextEncoding};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -292,7 +292,7 @@ impl Columns {
         });
     }
 
-    pub(crate) fn splice<O>(&mut self, pos: usize, ops: &[O], encoding: TextEncoding) -> usize
+    pub(crate) fn splice<O>(&mut self, pos: usize, ops: &[O], text_encoding: TextEncoding) -> usize
     where
         O: OpLike,
     {
@@ -343,9 +343,12 @@ impl Columns {
         self.index
             .mark
             .splice(pos, 0, ops.clone().map(O::mark_index).collect());
-        self.index
-            .text
-            .splice(pos, 0, ops.clone().map(|s| O::width(s, encoding.into())));
+        self.index.text.splice(
+            pos,
+            0,
+            ops.clone()
+                .map(|s| O::width(s, SequenceType::Text, text_encoding)),
+        );
         self.index.top.splice(pos, 0, ops.clone().map(O::top));
         self.index
             .visible
@@ -360,7 +363,7 @@ impl Columns {
     ) -> Self {
         let mut op_set = Self::default();
         let ops: Vec<_> = ops.collect();
-        op_set.splice(0, &ops, TextEncoding::default());
+        op_set.splice(0, &ops, TextEncoding::platform_default());
         op_set
     }
 
@@ -385,10 +388,11 @@ impl Columns {
         let mut value = self.value.raw_reader(0);
         let mut succ = self.succ_count.iter();
         let mut insert = self.insert.iter();
+        let mut text = self.index.text.iter();
         let mut vis = self.index.visible.iter();
         let mut top = self.index.top.iter();
         let mut pos = 0;
-        log!("::::: id       obj      key        elem     i v t act suc value");
+        log!("::::: id       obj      key        elem     i v t tx act suc value");
         loop {
             let id_a = fmt(id_a.next());
             let id_c = fmt(id_c.next());
@@ -396,6 +400,7 @@ impl Columns {
             let obj_c = fmt(obj_c.next());
             let act = fmt(act.next());
             let insert = fmt_bool(insert.next());
+            let text = fmt(text.next());
             let vis = fmt_bool(vis.next());
             let top = fmt_bool(top.next());
             let key_s = fmt(key_str.next());
@@ -413,7 +418,7 @@ impl Columns {
                 break;
             }
             log!(
-                "{:4}: {:8} {:8} {:10} {:8} {:1} {:1} {:1} {:3} {:1}   {}",
+                "{:4}: {:8} {:8} {:10} {:8} {:1} {:1} {:1} {:2} {:3} {:1}   {}",
                 pos,
                 format!("({}, {})", id_c, id_a),
                 format!("({}, {})", obj_c, obj_a),
@@ -422,6 +427,7 @@ impl Columns {
                 insert,
                 vis,
                 top,
+                text,
                 act,
                 succ,
                 v,

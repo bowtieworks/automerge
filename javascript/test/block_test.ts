@@ -170,6 +170,116 @@ describe("Automerge", () => {
         },
       ])
     })
+
+    it("should update marks", () => {
+      let doc = Automerge.from({ text: "hello world" })
+      doc = Automerge.change(doc, d => {
+        Automerge.updateSpans(
+          d,
+          ["text"],
+          [
+            { type: "text", value: "hello", marks: { bold: true } },
+            { type: "text", value: " " },
+            { type: "text", value: " world", marks: { italic: true } },
+          ],
+        )
+      })
+      const spans = Automerge.spans(doc, ["text"])
+      assert.deepStrictEqual(spans, [
+        { type: "text", value: "hello", marks: { bold: true } },
+        { type: "text", value: " " },
+        { type: "text", value: " world", marks: { italic: true } },
+      ])
+    })
+
+    it("allows configuring the default expand value of created marks", () => {
+      let doc = Automerge.from({ text: "" })
+      doc = Automerge.change(doc, d => {
+        Automerge.updateSpans(
+          d,
+          ["text"],
+          [
+            { type: "text", value: "hello", marks: { bold: true } },
+            { type: "text", value: " world" },
+          ],
+          { defaultExpand: "none" },
+        )
+      })
+      // Now insert a character at the end of the span
+      doc = Automerge.change(doc, d => {
+        Automerge.splice(d, ["text"], 5, 0, "!")
+      })
+      const spans = Automerge.spans(doc, ["text"])
+      // The bold span shouldn't expand because we set the defaultExpand to "none"
+      assert.deepStrictEqual(spans, [
+        { type: "text", value: "hello", marks: { bold: true } },
+        { type: "text", value: "! world" },
+      ])
+    })
+
+    it("should allow overriding the default expand on a per mark basis", () => {
+      let doc = Automerge.from({ text: "" })
+      doc = Automerge.change(doc, d => {
+        Automerge.updateSpans(
+          d,
+          ["text"],
+          [
+            { type: "text", value: "hello", marks: { bold: true } },
+            { type: "text", value: " world" },
+          ],
+          { defaultExpand: "none", perMarkExpand: { bold: "both" } },
+        )
+      })
+      // Now insert a character at the end of the span
+      doc = Automerge.change(doc, d => {
+        Automerge.splice(d, ["text"], 5, 0, "!")
+      })
+      const spans = Automerge.spans(doc, ["text"])
+      // The bold span should expand because we overrode the defaultExpand with "both"
+      assert.deepStrictEqual(spans, [
+        { type: "text", value: "hello!", marks: { bold: true } },
+        { type: "text", value: " world" },
+      ])
+    })
+
+    it("should allow omitting any part of the update spans config", () => {
+      let doc = Automerge.from({ text: "" })
+      doc = Automerge.change(doc, d => {
+        Automerge.updateSpans(
+          d,
+          ["text"],
+          [
+            { type: "text", value: "hello", marks: { bold: true } },
+            { type: "text", value: " world" },
+          ],
+          { defaultExpand: "none" }, // Only providing defaultExpand
+        )
+      })
+
+      doc = Automerge.change(doc, d => {
+        Automerge.updateSpans(
+          d,
+          ["text"],
+          [
+            { type: "text", value: "hello", marks: { bold: true } },
+            { type: "text", value: " world" },
+          ],
+          { perMarkExpand: { bold: "none" } }, // Only providing perMarkExpand
+        )
+      })
+
+      // no config at all
+      doc = Automerge.change(doc, d => {
+        Automerge.updateSpans(
+          d,
+          ["text"],
+          [
+            { type: "text", value: "hello", marks: { bold: true } },
+            { type: "text", value: " world" },
+          ],
+        )
+      })
+    })
   })
 
   describe("allows using RawString instead of RawString in block attributes", () => {
@@ -268,5 +378,17 @@ describe("Automerge", () => {
         { type: "text", value: " world" },
       ])
     })
+  })
+
+  it("can allow small values in block attributes", () => {
+    // Exercise an issue where very small floating point numbers were converted
+    // to 0 when stored in a block attribute
+    const smallnum = 1.401298464324817e-45
+    let doc = Automerge.from({ text: "" })
+    doc = Automerge.change(doc, d => {
+      Automerge.splitBlock(d, ["text"], 0, { smallnum })
+    })
+    const block = Automerge.block(doc, ["text"], 0)
+    assert.equal(block?.smallnum, smallnum)
   })
 })

@@ -4,10 +4,13 @@ import { STATE } from "./constants.js"
 
 import {
   type AutomergeValue,
+  type ConflictPatch,
   Counter,
   type Cursor,
   type CursorPosition,
   type Mark,
+  type MarkPatch,
+  type UnmarkPatch,
   type MarkSet,
   type MarkRange,
   type MarkValue,
@@ -52,6 +55,7 @@ import type {
   SyncMessage,
   Span,
   DecodedSyncMessage,
+  UpdateSpansConfig,
 } from "./wasm_types.js"
 export type {
   ChangeMetadata,
@@ -62,6 +66,7 @@ export type {
   IncPatch,
   Span,
   SyncMessage,
+  UpdateSpansConfig,
 } from "./wasm_types.js"
 
 /** @hidden **/
@@ -96,6 +101,8 @@ import {
   _trace,
   _obj,
 } from "./internal_state.js"
+
+export { applyPatch, applyPatches } from "./apply_patches.js"
 
 import { conflictAt } from "./conflicts.js"
 
@@ -1000,8 +1007,8 @@ export function getHistory<T>(doc: Doc<T>): State<T>[] {
  * If either of the heads are missing from the document the returned set of patches will be empty
  */
 export function diff(doc: Doc<unknown>, before: Heads, after: Heads): Patch[] {
-  checkHeads(before, "before")
-  checkHeads(after, "after")
+  checkHeads(before, "before heads")
+  checkHeads(after, "after heads")
   const state = _state(doc)
   if (
     state.mostRecentPatch &&
@@ -1027,7 +1034,7 @@ function headsEqual(heads1: Heads, heads2: Heads): boolean {
 
 function checkHeads(heads: Heads, fieldname: string) {
   if (!Array.isArray(heads)) {
-    throw new Error(`${fieldname} must be an array`)
+    throw new Error(`invalid ${fieldname}: must be an array`)
   }
 }
 
@@ -1521,8 +1528,21 @@ export function updateBlock<T>(
  * Like {@link updateText} this will diff `newSpans` against the current state
  * of the text at `path` and perform a reasonably minimal number of operations
  * required to update the spans to the new state.
+ *
+ * When updating spans, we need to know what to set the "expand" behavior of
+ * newly created marks to. By default we set it to "both", meaning that the
+ * spans will expand on either, but this can be overridden by passing
+ * `{ defaultExpand: "<expand>"}` as the final `config` parameter. You
+ * can also pass `{perMarkExpand: {"<markname>": "<expand config>"}` to
+ * set the expand configuration for specific marks where it should be
+ * different from the default.
  */
-export function updateSpans<T>(doc: Doc<T>, path: Prop[], newSpans: Span[]) {
+export function updateSpans<T>(
+  doc: Doc<T>,
+  path: Prop[],
+  newSpans: Span[],
+  config?: UpdateSpansConfig,
+) {
   if (!_is_proxy(doc)) {
     throw new RangeError("object cannot be modified outside of a change block")
   }
@@ -1531,9 +1551,9 @@ export function updateSpans<T>(doc: Doc<T>, path: Prop[], newSpans: Span[]) {
   _clear_cache(doc)
 
   try {
-    state.handle.updateSpans(objPath, newSpans)
+    state.handle.updateSpans(objPath, newSpans, config)
   } catch (e) {
-    throw new RangeError(`Cannot updateBlock: ${e}`)
+    throw new RangeError(`Cannot updateSpans: ${e}`)
   }
 }
 
@@ -1685,122 +1705,6 @@ function absoluteObjPath(
   return path.join("/")
 }
 
-export function applyPatch(doc: unknown, patch: Patch) {
-  let [lastProp, ...parentPath] = patch.path.slice(-2).reverse()
-  let parent = parentPath.reduce((obj: any, prop) => obj[prop], doc)
-  if (!parent) {
-    throw new RangeError(`target not found for patch`)
-  }
-
-  if (patch.action === "put") {
-    parent[lastProp] = patch.value
-  } else if (patch.action === "insert") {
-    if (!Array.isArray(parent)) {
-      throw new RangeError(`target is not an array for patch`)
-    }
-    if (!(typeof lastProp === "number")) {
-      throw new RangeError(`index is not a number for patch`)
-    }
-    parent.splice(lastProp, 0, ...patch.values)
-  } else if (patch.action === "del") {
-    if (!(typeof lastProp === "number")) {
-      throw new RangeError(`index is not a number for patch`)
-    }
-    if (Array.isArray(parent)) {
-      parent.splice(lastProp, patch.length || 1)
-    } else if (typeof parent === "string") {
-      if (isAutomerge(doc)) {
-        splice(doc as Doc<unknown>, parentPath, lastProp, patch.length || 1)
-      } else {
-        applyStringPatchToJs(doc, patch)
-      }
-    } else {
-      throw new RangeError(`target is not an array or string for patch`)
-    }
-  } else if (patch.action === "splice") {
-    let target = parent[lastProp]
-    if (!(typeof lastProp === "number")) {
-      throw new RangeError(`index is not a number for patch`)
-    }
-    if (isAutomerge(doc)) {
-      splice(doc as Doc<unknown>, parentPath, lastProp, 0, patch.value)
-    } else {
-      applyStringPatchToJs(doc, patch)
-    }
-  } else if (patch.action === "inc") {
-    const counter = parent[lastProp]
-    if (isAutomerge(doc)) {
-      if (!isCounter(counter)) {
-        throw new RangeError(`target is not a counter for patch`)
-      }
-      counter.increment(patch.value)
-    } else {
-      if (!(typeof counter === "number")) {
-        throw new RangeError(`target is not a number for patch`)
-      }
-      parent[lastProp] = counter + patch.value
-    }
-  } else if (patch.action === "mark") {
-    if (!isAutomerge(doc)) {
-      return
-    }
-    for (const markSpec of patch.marks) {
-      mark(
-        doc as Doc<unknown>,
-        patch.path,
-        // TODO: add mark expansion to patches. This will require emitting
-        // the expand values in patches.
-        { start: markSpec.start, end: markSpec.end, expand: "none" },
-        markSpec.name,
-        markSpec.value,
-      )
-    }
-  } else if (patch.action === "unmark") {
-    if (!isAutomerge(doc)) {
-      return
-    }
-    unmark(
-      doc as Doc<unknown>,
-      patch.path,
-      { start: patch.start, end: patch.end, expand: "none" },
-      patch.name,
-    )
-  } else if (patch.action === "conflict") {
-    // Ignore conflict patches
-  } else {
-    throw new RangeError(`unsupported patch: ${patch}`)
-  }
-}
-
-function applyStringPatchToJs(doc: unknown, patch: Patch) {
-  let [lastProp, ...parentPath] = patch.path.slice(-2).reverse()
-  if (typeof lastProp !== "number") {
-    throw new RangeError(`lastProp is not a number`)
-  }
-  let parent = parentPath.reduce((obj: any, prop) => obj[prop], doc)
-  let [_, grandParentProp, ...grandParentPath] = patch.path.slice(-2).reverse()
-  let grandParent = grandParentPath.reduce((obj: any, prop) => obj[prop], doc)
-  let target = grandParent[grandParentProp]
-  if (!target || !(typeof grandParent === "object")) {
-    throw new RangeError(`target is not found for patch`)
-  }
-  if (patch.action === "splice") {
-    let newString =
-      target.slice(0, lastProp) + patch.value + target.slice(lastProp)
-    grandParent[grandParentProp] = newString
-  } else if (patch.action === "del") {
-    let newString =
-      target.slice(0, lastProp) + target.slice(lastProp + (patch.length || 1))
-    grandParent[grandParentProp] = newString
-  }
-}
-
-export function applyPatches(doc: unknown, patches: Patch[]) {
-  for (const patch of patches) {
-    applyPatch(doc, patch)
-  }
-}
-
 /**
  * @deprecated This method has been renamed to {@link isImmutableString}
  */
@@ -1809,3 +1713,27 @@ export const isRawString = isImmutableString
  * @deprecated This type has been renamed to {@link ImmutableString}
  */
 export const RawString = ImmutableString
+
+/**
+ * EXPERIMENTAL: save a bundle of changes from a document to an encoded form
+ * @experimental
+ * @param doc - The document containing the changes to save
+ * @param hashes - The hashes of the changes to save to a bundle
+ * @returns
+ */
+export function saveBundle(doc: Doc<unknown>, hashes: string[]): Uint8Array {
+  const state = _state(doc, false)
+  return state.handle.saveBundle(hashes)
+}
+
+/**
+ * EXPERIMENTAL: Load a bundle of changes to examine them
+ * @experimental
+ * @param bundle - The encoded bundle to read
+ */
+export function readBundle(bundle: Uint8Array): {
+  changes: DecodedChange[]
+  deps: Heads
+} {
+  return ApiHandler.readBundle(bundle)
+}
